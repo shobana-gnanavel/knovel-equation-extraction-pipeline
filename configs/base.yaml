@@ -1,0 +1,36 @@
+# Base configuration — canonical defaults for all environments.
+# Override per-environment in local.yaml or production.yaml.
+# All values here mirror the defaults in src/equation_extraction_pipeline/config/settings.py.
+
+paths:
+  input_dir: "data/input"
+  output_dir: "outputs"
+
+ollama:
+  base_url: "http://localhost:11434"
+  vl_model: "qwen2.5vl:7b"
+  timeout: 120
+
+rendering:
+  dpi_scanned: 300
+  dpi_digital: 216
+
+preprocessing:
+  deskew_threshold: 0.3
+  denoise_strength: 10
+
+detection:
+  crop_padding_px: 8
+  formula_threshold: 0.45
+  ambiguous_threshold: 0.25
+
+recognition:
+  retry_threshold: 0.6
+  max_retries: 2
+
+confidence:
+  min_acceptable: 0.5
+
+logging:
+  level: "INFO"
+  format: "json"

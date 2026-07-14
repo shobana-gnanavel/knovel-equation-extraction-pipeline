@@ -1,0 +1,18 @@
+# Optional corporate-CA build overlay.
+#
+# Usage:
+#   CORPORATE_CA_CERT_PATH=/absolute/path/company-ca.crt \
+#     docker compose -f docker-compose.yml -f docker-compose.ca.yml build --no-cache pipeline
+#
+# The certificate is exposed only as a BuildKit secret and is not copied from
+# the build context or persisted as a Docker build argument.
+services:
+  pipeline:
+    build:
+      secrets:
+        - source: corporate_ca
+          target: corporate_ca
+
+secrets:
+  corporate_ca:
+    file: ${CORPORATE_CA_CERT_PATH:?Set CORPORATE_CA_CERT_PATH to the corporate CA certificate}

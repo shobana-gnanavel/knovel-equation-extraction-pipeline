@@ -1,0 +1,1426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Knovel · Document Intelligence</title>
+
+  <!-- Inter font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind CSS (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Alpine.js -->
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: {
+            navy: {
+              950: '#07091a',
+              900: '#0b0f1e',
+              800: '#0f1629',
+              700: '#141f38',
+              600: '#1a2845',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    /* ── Base ─────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { font-family: 'Inter', sans-serif; background: #09101f; color: #e2e8f0; }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    .sidebar {
+      background: linear-gradient(180deg, #0f1629 0%, #090f1d 100%);
+      border-right: 1px solid rgba(255,255,255,0.05);
+    }
+
+    /* ── Nav items ───────────────────────────────────────────────────────── */
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px; border-radius: 8px; cursor: pointer;
+      transition: all .18s; color: #64748b; font-size: 13.5px; font-weight: 500;
+      user-select: none;
+    }
+    .nav-item:hover   { background: rgba(99,160,255,.08);  color: #cbd5e1; }
+    .nav-item.active  { background: rgba(99,160,255,.13);  color: #5b9cf6; }
+    .nav-item svg     { width: 16px; height: 16px; flex-shrink: 0; }
+
+    /* ── Cards ───────────────────────────────────────────────────────────── */
+    .card {
+      background: #111827;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 14px;
+    }
+
+    .metric-card {
+      background: linear-gradient(135deg, #111827 0%, #161f33 100%);
+      border: 1px solid rgba(99,160,255,.12);
+      border-radius: 14px;
+      padding: 22px 20px;
+      transition: border-color .2s;
+    }
+    .metric-card:hover { border-color: rgba(99,160,255,.28); }
+
+    /* ── Stage badges ────────────────────────────────────────────────────── */
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 9px; border-radius: 20px;
+      font-size: 11.5px; font-weight: 600; letter-spacing: .02em;
+    }
+    .badge-pending  { background: rgba(100,116,139,.15); color: #64748b; }
+    .badge-running  { background: rgba(251,191,36,.15);  color: #fbbf24; }
+    .badge-done,
+    .badge-completed{ background: rgba(16,185,129,.15);  color: #10b981; }
+    .badge-failed   { background: rgba(239,68,68,.15);   color: #ef4444; }
+    .badge-queued   { background: rgba(100,116,139,.12); color: #94a3b8; }
+
+    /* ── Pipeline step flow ──────────────────────────────────────────────── */
+    .pipe-step {
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      min-width: 64px;
+    }
+    .pipe-icon {
+      width: 36px; height: 36px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700; transition: all .3s;
+      border: 2px solid transparent;
+    }
+    .pipe-step.s-pending .pipe-icon { background: rgba(100,116,139,.14); color: #64748b; border-color: rgba(100,116,139,.25); }
+    .pipe-step.s-running .pipe-icon { background: rgba(251,191,36,.14);  color: #fbbf24; border-color: #fbbf24; animation: glow 1.4s infinite; }
+    .pipe-step.s-done    .pipe-icon { background: rgba(16,185,129,.14);  color: #10b981; border-color: #10b981; }
+    .pipe-step.s-failed  .pipe-icon { background: rgba(239,68,68,.14);   color: #ef4444; border-color: #ef4444; }
+    .pipe-label { font-size: 10px; color: #64748b; text-align: center; line-height: 1.3; max-width: 60px; }
+    .pipe-step.s-done    .pipe-label { color: #10b981; }
+    .pipe-step.s-running .pipe-label { color: #fbbf24; }
+
+    .pipe-connector { flex: 1; height: 2px; background: rgba(255,255,255,.08); margin-top: -22px; transition: background .4s; }
+    .pipe-connector.done { background: #10b981; }
+
+    @keyframes glow {
+      0%,100% { box-shadow: 0 0 0 0 rgba(251,191,36,.3); }
+      50%      { box-shadow: 0 0 0 6px rgba(251,191,36,.0); }
+    }
+
+    /* ── Progress bar ────────────────────────────────────────────────────── */
+    .prog-track { height: 6px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .prog-fill  { height: 100%; border-radius: 3px;
+                  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+                  transition: width .5s cubic-bezier(.4,0,.2,1); }
+
+    /* ── Upload zone ─────────────────────────────────────────────────────── */
+    .upload-zone {
+      border: 2px dashed rgba(99,160,255,.25);
+      border-radius: 14px;
+      background: rgba(99,160,255,.025);
+      cursor: pointer; transition: all .25s;
+    }
+    .upload-zone:hover, .upload-zone.over {
+      border-color: #5b9cf6;
+      background: rgba(99,160,255,.07);
+    }
+
+    /* ── Primary button ──────────────────────────────────────────────────── */
+    .btn-primary {
+      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+      color: #fff; border: none; border-radius: 10px;
+      padding: 12px 28px; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: opacity .2s, transform .1s;
+      width: 100%;
+    }
+    .btn-primary:hover:not(:disabled) { opacity: .92; transform: translateY(-1px); }
+    .btn-primary:active:not(:disabled) { transform: translateY(0); }
+    .btn-primary:disabled { opacity: .38; cursor: not-allowed; }
+
+    /* ── Log viewer ──────────────────────────────────────────────────────── */
+    .log-box {
+      background: #060c19; border: 1px solid rgba(255,255,255,.05);
+      border-radius: 10px; max-height: 220px; overflow-y: auto;
+      font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 11.5px;
+    }
+    .log-row { display: flex; gap: 8px; padding: 3px 12px; line-height: 1.7; }
+    .log-ts   { color: #334155; min-width: 65px; }
+    .log-lvl  { border-radius: 3px; padding: 0 5px; font-weight: 600; font-size: 10px; align-self: center; }
+    .lvl-info { background: rgba(59,130,246,.15); color: #60a5fa; }
+    .lvl-warn { background: rgba(245,158,11,.15); color: #fbbf24; }
+    .lvl-error{ background: rgba(239,68,68,.15);  color: #f87171; }
+    .log-stage{ color: #475569; min-width: 90px; }
+    .log-msg  { color: #94a3b8; flex: 1; }
+
+    /* ── Report iframe ───────────────────────────────────────────────────── */
+    .report-frame {
+      width: 100%; height: 100%;
+      border: none; border-radius: 0;
+      background: #fff;
+    }
+
+    /* ── Table ───────────────────────────────────────────────────────────── */
+    .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .data-table th {
+      text-align: left; padding: 10px 18px;
+      font-size: 11px; font-weight: 600; letter-spacing: .06em;
+      color: #475569; text-transform: uppercase;
+      border-bottom: 1px solid rgba(255,255,255,.05);
+    }
+    .data-table td { padding: 11px 18px; border-bottom: 1px solid rgba(255,255,255,.04); color: #cbd5e1; }
+    .data-table tr:last-child td { border-bottom: none; }
+    .data-table tr:hover td { background: rgba(255,255,255,.02); }
+
+    /* ── Pipeline architecture grid ──────────────────────────────────────── */
+    .stage-pill {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 14px; border-radius: 10px;
+      background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05);
+      transition: border-color .2s;
+    }
+    .stage-pill:hover { border-color: rgba(99,160,255,.2); }
+    .stage-num {
+      width: 26px; height: 26px; border-radius: 7px;
+      background: rgba(99,160,255,.18); color: #5b9cf6;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 700; flex-shrink: 0;
+    }
+
+    /* ── Completion card ─────────────────────────────────────────────────── */
+    .card-success { border-color: rgba(16,185,129,.2) !important; background: rgba(16,185,129,.04) !important; }
+    .card-error   { border-color: rgba(239,68,68,.2)  !important; background: rgba(239,68,68,.04)  !important; }
+
+    /* ── Scrollbar ───────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.08); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.16); }
+
+    /* ── Animations ──────────────────────────────────────────────────────── */
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    [x-show] { animation: fadeIn .2s ease; }
+
+    /* ── Dot status ──────────────────────────────────────────────────────── */
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot-green  { background: #10b981; }
+    .dot-amber  { background: #f59e0b; animation: blink 1.2s infinite; }
+    .dot-red    { background: #ef4444; }
+    .dot-gray   { background: #475569; }
+    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+
+    /* ── Info tooltip (ⓘ) ───────────────────────────────────────────────── */
+    .tip-btn {
+      position: relative;
+      width: 15px; height: 15px; border-radius: 50%;
+      background: rgba(99,160,255,.12); border: 1px solid rgba(99,160,255,.25);
+      color: #5b9cf6; font-size: 9px; font-weight: 700; font-style: italic;
+      cursor: help; display: inline-flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: background .15s; vertical-align: middle;
+      line-height: 1; letter-spacing: 0; margin-left: 4px;
+    }
+    .tip-btn:hover { background: rgba(99,160,255,.28); }
+    .tip-btn::after {
+      content: attr(data-tip);
+      position: absolute; top: calc(100% + 7px); left: 50%; transform: translateX(-50%);
+      background: #1a2540; border: 1px solid rgba(99,160,255,.2);
+      color: #cbd5e1; font-size: 12px; font-weight: 400; font-style: normal;
+      padding: 9px 13px; border-radius: 9px; width: 240px;
+      white-space: normal; text-align: left;
+      opacity: 0; pointer-events: none; transition: opacity .15s;
+      z-index: 300; line-height: 1.55; text-transform: none; letter-spacing: 0;
+      box-shadow: 0 8px 28px rgba(0,0,0,.55);
+    }
+    .tip-btn:hover::after { opacity: 1; }
+    .tip-left::after { left: auto; right: 0; transform: none; }
+
+    /* ── Coverage / quality bars ─────────────────────────────────────────── */
+    .cov-track { height: 10px; border-radius: 5px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .cov-fill  { height: 100%; border-radius: 5px; transition: width .7s cubic-bezier(.4,0,.2,1); }
+    .cov-good  { background: linear-gradient(90deg, #10b981, #34d399); }
+    .cov-warn  { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .cov-bad   { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+    /* ── Verdict segmented bar ───────────────────────────────────────────── */
+    .vbar { height: 7px; border-radius: 4px; overflow: hidden; display: flex; gap: 1px; background: rgba(255,255,255,.06); }
+    .vbar-accept { background: #10b981; transition: width .5s; }
+    .vbar-review { background: #f59e0b; transition: width .5s; }
+    .vbar-reject { background: #ef4444; transition: width .5s; }
+
+    /* ── Section label ───────────────────────────────────────────────────── */
+    .section-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .09em; color: #334155; margin-bottom: 10px; display: flex; align-items: center; gap: 4px; }
+
+    /* ── Health / AI panel ───────────────────────────────────────────────── */
+    .health-panel { border-radius: 14px; padding: 18px 22px; border: 1px solid rgba(255,255,255,.06); background: linear-gradient(135deg,#111827 0%,#0e1728 100%); }
+    .panel-divider { width: 1px; background: rgba(255,255,255,.06); align-self: stretch; margin: 0 8px; flex-shrink: 0; }
+
+    /* ── Coverage verdict badges ─────────────────────────────────────────── */
+    .badge-complete  { background: rgba(16,185,129,.15);  color: #10b981; border: 1px solid rgba(16,185,129,.35); }
+    .badge-partial   { background: rgba(245,158,11,.15);  color: #f59e0b; border: 1px solid rgba(245,158,11,.35); }
+    .badge-incomplete{ background: rgba(239,68,68,.15);   color: #ef4444; border: 1px solid rgba(239,68,68,.35); }
+    .badge-unknown   { background: rgba(100,116,139,.15); color: #94a3b8; border: 1px solid rgba(100,116,139,.3); }
+  </style>
+</head>
+
+<body x-data="dashboard()" x-init="init()">
+<div class="flex" style="height:100vh; overflow:hidden;">
+
+  <!-- ═══════════════════════════════════════════════════════ SIDEBAR ═══ -->
+  <aside class="sidebar flex flex-col flex-shrink-0" style="width:252px;">
+
+    <!-- Logo -->
+    <div class="flex items-center gap-3 px-5 py-5 border-b" style="border-color:rgba(255,255,255,.05);">
+      <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#fff;flex-shrink:0;">K</div>
+      <div>
+        <div style="font-weight:700;font-size:14px;color:#f1f5f9;line-height:1.2;">Knovel</div>
+        <div style="font-size:11px;color:#475569;">Document Intelligence</div>
+      </div>
+    </div>
+
+    <!-- Nav -->
+    <nav class="flex-1 p-3 flex flex-col gap-1">
+      <div style="font-size:10.5px;font-weight:600;letter-spacing:.09em;color:#334155;text-transform:uppercase;padding:10px 14px 6px;">Navigation</div>
+
+      <a class="nav-item" :class="{active: view==='overview'}" @click="setView('overview')">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Overview
+      </a>
+      <a class="nav-item" :class="{active: view==='extract'}" @click="setView('extract')">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
+        New Extraction
+      </a>
+      <a class="nav-item" :class="{active: view==='reports'}" @click="setView('reports')">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+        Reports
+      </a>
+      <a class="nav-item" :class="{active: view==='analytics'}" @click="setView('analytics')">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z"/></svg>
+        Analytics
+      </a>
+    </nav>
+
+    <!-- System status -->
+    <div class="p-4 border-t" style="border-color:rgba(255,255,255,.05);">
+      <div style="font-size:10.5px;color:#475569;font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px;">System Status</div>
+      <div class="flex items-center gap-2 mb-2">
+        <span class="dot dot-green"></span>
+        <span style="font-size:12px;color:#64748b;">9 stages · operational</span>
+      </div>
+      <div class="flex items-center gap-2 mb-3">
+        <span class="dot" :class="jobs.some(j=>j.status==='running') ? 'dot-amber' : 'dot-gray'"></span>
+        <span style="font-size:12px;color:#64748b;" x-text="jobs.some(j=>j.status==='running') ? 'Processing active' : 'Idle'"></span>
+      </div>
+      <div style="font-size:11px;color:#334155;">v1.0.0 · Spec-Driven</div>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════════════════════════════════════════ MAIN ════════ -->
+  <main class="flex-1 flex flex-col" style="overflow:hidden;">
+
+    <!-- Top bar -->
+    <header class="flex items-center px-8 flex-shrink-0"
+            style="height:56px;border-bottom:1px solid rgba(255,255,255,.05);background:#0b1120;">
+      <h1 style="font-size:15px;font-weight:600;color:#f1f5f9;" x-text="viewTitle"></h1>
+      <div class="ml-auto flex items-center gap-5">
+        <div class="flex items-center gap-1.5">
+          <span class="dot dot-green" style="animation:blink 2s infinite;"></span>
+          <span style="font-size:12px;color:#475569;">Live</span>
+        </div>
+        <span style="font-size:12px;color:#334155;font-variant-numeric:tabular-nums;" x-text="clockTime"></span>
+      </div>
+    </header>
+
+    <!-- ── Scrollable content area ───────────────────────────────────── -->
+    <div class="flex-1" style="overflow-y:auto;">
+
+      <!-- ════════════════════════════════════════════ OVERVIEW ══════ -->
+      <div x-show="view==='overview'" class="p-8">
+
+        <!-- Hero -->
+        <div class="mb-8">
+          <h2 style="font-size:24px;font-weight:800;color:#f1f5f9;letter-spacing:-.02em;margin-bottom:6px;">
+            Document Intelligence Pipeline
+          </h2>
+          <p style="color:#475569;font-size:14px;">
+            Enterprise PDF extraction · 15 independent pipeline stages · Strategy-pattern architecture
+          </p>
+        </div>
+
+        <!-- ── HEALTH SCORECARD (shown when coverage data exists) ─────────── -->
+        <template x-if="latestMetrics && latestMetrics.pdf_labeled_count > 0">
+          <div class="health-panel mb-6 flex" style="gap:0;overflow:visible;">
+
+            <!-- Coverage -->
+            <div style="flex:2.2;padding-right:24px;">
+              <div class="section-label">
+                Extraction Coverage
+                <span class="tip-btn" data-tip="How many of the expected equations (counted from PDF equation labels) were successfully extracted. ≥95% = Complete, 70–94% = Partial, <70% = Incomplete.">i</span>
+              </div>
+              <div class="flex items-end gap-3 mb-2">
+                <div style="font-size:40px;font-weight:800;line-height:1;"
+                     :style="latestMetrics.pdf_coverage_pct>=95?'color:#10b981':latestMetrics.pdf_coverage_pct>=70?'color:#f59e0b':'color:#ef4444'"
+                     x-text="latestMetrics.pdf_coverage_pct!=null?latestMetrics.pdf_coverage_pct+'%':'—'"></div>
+                <div style="padding-bottom:6px;">
+                  <span class="badge"
+                        :class="latestMetrics.llm_coverage_verdict==='complete'?'badge-complete':latestMetrics.llm_coverage_verdict==='partial'?'badge-partial':latestMetrics.llm_coverage_verdict==='unknown'?'badge-unknown':'badge-incomplete'"
+                        x-text="latestMetrics.llm_coverage_verdict==='complete'?'✓ COMPLETE':latestMetrics.llm_coverage_verdict==='partial'?'⚠ PARTIAL':latestMetrics.llm_coverage_verdict==='unknown'?'— N/A':'✗ INCOMPLETE'">
+                  </span>
+                </div>
+              </div>
+              <div class="cov-track mb-2">
+                <div class="cov-fill"
+                     :class="latestMetrics.pdf_coverage_pct>=95?'cov-good':latestMetrics.pdf_coverage_pct>=70?'cov-warn':'cov-bad'"
+                     :style="`width:${Math.min(latestMetrics.pdf_coverage_pct||0,100)}%`"></div>
+              </div>
+              <div style="font-size:12px;color:#475569;"
+                   x-text="`${latestMetrics.total_equations} extracted of ${latestMetrics.pdf_labeled_count} labeled in PDF`"></div>
+            </div>
+
+            <div class="panel-divider"></div>
+
+            <!-- AI Verdict breakdown -->
+            <div style="flex:2;padding:0 24px;">
+              <div class="section-label">
+                AI Quality Verdicts
+                <span class="tip-btn" data-tip="The configured vision LLM reviews each equation crop and candidate LaTeX. Accept, Review, and Reject summarize its quality verdicts.">i</span>
+              </div>
+              <template x-if="latestMetrics.llm_total > 0">
+                <div>
+                  <div class="vbar mb-3">
+                    <div class="vbar-accept" :style="`width:${latestMetrics.llm_accepted/latestMetrics.llm_total*100}%`"></div>
+                    <div class="vbar-review" :style="`width:${latestMetrics.llm_reviewed/latestMetrics.llm_total*100}%`"></div>
+                    <div class="vbar-reject" :style="`width:${latestMetrics.llm_rejected/latestMetrics.llm_total*100}%`"></div>
+                  </div>
+                  <div class="flex gap-5">
+                    <div>
+                      <div style="font-size:22px;font-weight:800;color:#10b981;" x-text="latestMetrics.llm_accepted??'—'"></div>
+                      <div style="font-size:11px;color:#475569;">Accepted</div>
+                    </div>
+                    <div>
+                      <div style="font-size:22px;font-weight:800;color:#f59e0b;" x-text="latestMetrics.llm_reviewed??'—'"></div>
+                      <div style="font-size:11px;color:#475569;">Review</div>
+                    </div>
+                    <div>
+                      <div style="font-size:22px;font-weight:800;color:#ef4444;" x-text="latestMetrics.llm_rejected??'—'"></div>
+                      <div style="font-size:11px;color:#475569;">Rejected</div>
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <template x-if="!latestMetrics.llm_total">
+                <div style="font-size:12px;color:#334155;margin-top:8px;">No AI assessment yet — run validation to populate</div>
+              </template>
+            </div>
+
+            <div class="panel-divider"></div>
+
+            <!-- Mean AI Score -->
+            <div style="flex:1;padding-left:24px;">
+              <div class="section-label">
+                Avg AI Score
+                <span class="tip-btn tip-left" data-tip="Mean overall score (0–10) from the configured vision LLM judge. ≥8 = production-ready, 5–7 = needs improvement, <5 = significant extraction issues.">i</span>
+              </div>
+              <div style="font-size:40px;font-weight:800;line-height:1;margin-bottom:6px;"
+                   :style="(latestMetrics.llm_mean_overall??0)>=8?'color:#10b981':(latestMetrics.llm_mean_overall??0)>=5?'color:#f59e0b':'color:#ef4444'"
+                   x-text="latestMetrics.llm_mean_overall!=null?latestMetrics.llm_mean_overall+'/10':'—'"></div>
+              <div style="font-size:12px;color:#475569;">Vision LLM overall quality</div>
+            </div>
+
+          </div>
+        </template>
+
+        <!-- KPI cards -->
+        <div class="grid grid-cols-4 gap-4 mb-8">
+          <div class="metric-card">
+            <div class="flex items-center justify-between" style="margin-bottom:10px;">
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#475569;">Total Equations</div>
+              <span class="tip-btn" data-tip="Total equations detected and extracted across all completed jobs. Includes both display (block) equations and inline equations.">i</span>
+            </div>
+            <div style="font-size:34px;font-weight:800;color:#60a5fa;line-height:1;" x-text="latestMetrics?.total_equations ?? '—'"></div>
+            <div style="font-size:12px;color:#334155;margin-top:6px;" x-text="latestMetrics ? `${latestMetrics.display_equations} display · ${latestMetrics.pages_with_equations} pages` : 'No data yet'"></div>
+          </div>
+          <div class="metric-card">
+            <div class="flex items-center justify-between" style="margin-bottom:10px;">
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#475569;">LaTeX Generation</div>
+              <span class="tip-btn" data-tip="% of display equations for which a LaTeX string was generated. A drop here means OCR/extraction failed to produce machine-readable math.">i</span>
+            </div>
+            <div style="font-size:34px;font-weight:800;color:#34d399;line-height:1;" x-text="latestMetrics ? latestMetrics.latex_generation_rate+'%' : '—'"></div>
+            <div style="font-size:12px;color:#334155;margin-top:6px;" x-text="latestMetrics ? `${latestMetrics.inline_equations} inline · ${latestMetrics.display_equations} display` : 'Display equations with LaTeX'"></div>
+          </div>
+          <div class="metric-card">
+            <div class="flex items-center justify-between" style="margin-bottom:10px;">
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#475569;">LaTeX Validity</div>
+              <span class="tip-btn" data-tip="% of generated LaTeX strings that are structurally valid (balanced braces, known commands). Rule-based check — use AI verdict for semantic correctness.">i</span>
+            </div>
+            <div style="font-size:34px;font-weight:800;color:#a78bfa;line-height:1;" x-text="latestMetrics ? latestMetrics.latex_validity_rate+'%' : '—'"></div>
+            <div style="font-size:12px;color:#334155;margin-top:6px;" x-text="latestMetrics?.needs_review_count ? `${latestMetrics.needs_review_count} need review` : 'Structurally valid LaTeX'"></div>
+          </div>
+          <div class="metric-card">
+            <div class="flex items-center justify-between" style="margin-bottom:10px;">
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#475569;">LaTeX Quality Score</div>
+              <span class="tip-btn tip-left" data-tip="Rule-based weighted quality score. Good (≥75%): all completeness checks pass. Warn (50–74%): minor issues. Fail (<50%): label-only or OCR failure.">i</span>
+            </div>
+            <div style="font-size:34px;font-weight:800;line-height:1;"
+                 :style="latestMetrics?.latex_quality_score >= 80 ? 'color:#10b981' : latestMetrics?.latex_quality_score >= 60 ? 'color:#f59e0b' : 'color:#ef4444'"
+                 x-text="latestMetrics ? latestMetrics.latex_quality_score+'%' : '—'"></div>
+            <div style="font-size:12px;color:#334155;margin-top:6px;"
+                 x-text="latestMetrics?.quality_distribution ? `${latestMetrics.quality_distribution.good} good · ${latestMetrics.quality_distribution.warn} warn · ${latestMetrics.quality_distribution.fail} fail` : 'Structural quality of extracted LaTeX'"></div>
+          </div>
+        </div>
+
+        <!-- Recent jobs -->
+        <div class="card mb-8">
+          <div class="flex items-center justify-between p-5 border-b" style="border-color:rgba(255,255,255,.05);">
+            <div>
+              <div style="font-size:14px;font-weight:600;color:#f1f5f9;">Recent Extraction Jobs</div>
+              <div style="font-size:12px;color:#475569;margin-top:2px;">All documents processed through the pipeline</div>
+            </div>
+            <button @click="setView('extract')"
+                    style="font-size:12px;font-weight:600;color:#5b9cf6;padding:6px 14px;border-radius:7px;border:1px solid rgba(99,160,255,.25);background:rgba(99,160,255,.07);cursor:pointer;">
+              + New Extraction
+            </button>
+          </div>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Document</th>
+                <th>Equations</th>
+                <th>LaTeX Valid</th>
+                <th>LaTeX Quality</th>
+                <th>Time Taken</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="job in jobs" :key="job.id">
+                <tr>
+                  <td><code style="font-size:12px;color:#64748b;" x-text="job.id"></code></td>
+                  <td style="color:#e2e8f0;font-weight:500;" x-text="job.filename"></td>
+                  <td x-text="job.metrics?.total_equations ?? '—'"></td>
+                  <td>
+                    <span x-show="job.metrics" x-text="job.metrics?.latex_validity_rate+'%'" style="font-weight:600;color:#34d399;"></span>
+                    <span x-show="!job.metrics" style="color:#334155;">—</span>
+                  </td>
+                  <td>
+                    <span x-show="job.metrics && job.metrics.latex_quality_score > 0"
+                          x-text="job.metrics?.latex_quality_score+'%'"
+                          :style="job.metrics?.latex_quality_score >= 80 ? 'font-weight:600;color:#10b981' : job.metrics?.latex_quality_score >= 60 ? 'font-weight:600;color:#f59e0b' : 'font-weight:600;color:#ef4444'"></span>
+                    <span x-show="!job.metrics || !job.metrics.latex_quality_score" style="color:#334155;">—</span>
+                  </td>
+                  <td style="font-variant-numeric:tabular-nums;color:#94a3b8;font-size:13px;"
+                      x-text="formatDuration(job.time_taken_seconds)"></td>
+                  <td>
+                    <span class="badge" :class="`badge-${job.status}`" x-text="job.status"></span>
+                  </td>
+                  <td class="flex gap-2 items-center">
+                    <button x-show="job.status==='completed'"
+                            @click="viewReport(job.id)"
+                            style="font-size:12px;font-weight:500;color:#60a5fa;cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid rgba(99,160,255,.2);background:rgba(99,160,255,.06);">
+                      View Report
+                    </button>
+                    <button x-show="job.status==='running'"
+                            @click="watchJob(job.id)"
+                            style="font-size:12px;font-weight:500;color:#fbbf24;cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.06);">
+                      Watch
+                    </button>
+                    <span x-show="job.status==='queued'" style="font-size:12px;color:#475569;">Queued…</span>
+                    <button x-show="job.status==='completed' || job.status==='failed'"
+                            @click="rerunJob(job.id)"
+                            style="font-size:12px;font-weight:500;color:#fb923c;cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid rgba(251,146,60,.2);background:rgba(251,146,60,.06);">
+                      Rerun
+                    </button>
+                    <button @click="deleteJob(job.id, job.filename, job.status)"
+                            style="font-size:12px;font-weight:500;color:#f87171;cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid rgba(239,68,68,.2);background:rgba(239,68,68,.06);">
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              </template>
+              <tr x-show="jobs.length===0">
+                <td colspan="8" style="text-align:center;padding:40px;color:#334155;">
+                  No extraction jobs yet. Upload a PDF to get started.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Pipeline architecture -->
+        <div class="card">
+          <div class="p-5 border-b" style="border-color:rgba(255,255,255,.05);">
+            <div style="font-size:14px;font-weight:600;color:#f1f5f9;">Pipeline Architecture</div>
+            <div style="font-size:12px;color:#475569;margin-top:2px;">9 independently testable stages · Clean Architecture · Strategy Pattern</div>
+          </div>
+          <div class="p-5 grid grid-cols-3 gap-3">
+            <template x-for="([name,label],i) in stages" :key="name">
+              <div class="stage-pill">
+                <div class="stage-num" x-text="i+1"></div>
+                <span style="font-size:13px;color:#cbd5e1;" x-text="label"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+
+      </div><!-- /overview -->
+
+      <!-- ════════════════════════════════════════════ EXTRACT ═══════ -->
+      <div x-show="view==='extract'" class="p-8">
+        <div style="max-width:680px;margin:0 auto;">
+
+          <!-- Upload zone -->
+          <div class="upload-zone p-14 text-center mb-5"
+               :class="{'over': isDragging}"
+               @dragover.prevent="isDragging=true"
+               @dragleave="isDragging=false"
+               @drop.prevent="handleDrop"
+               @click="$refs.fileInput.click()">
+            <input type="file" accept=".pdf" x-ref="fileInput" style="display:none;" @change="handleFile">
+            <div style="font-size:40px;margin-bottom:14px;line-height:1;">
+              <span x-show="!uploadFile">⬆</span>
+              <span x-show="uploadFile">📄</span>
+            </div>
+            <div style="font-size:16px;font-weight:600;color:#e2e8f0;margin-bottom:6px;"
+                 x-text="uploadFile ? uploadFile.name : 'Drag & drop your PDF here'"></div>
+            <div style="font-size:13px;color:#475569;"
+                 x-text="uploadFile ? ((uploadFile.size/1048576).toFixed(1)+' MB · Click to change') : 'or click to browse · PDF files up to 500 MB'"></div>
+          </div>
+
+          <!-- Force re-extract toggle -->
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">
+              <div style="position:relative;width:38px;height:22px;">
+                <input type="checkbox" x-model="forceReextract" style="opacity:0;width:0;height:0;position:absolute;">
+                <div :style="forceReextract ? 'background:#ef4444' : 'background:#334155'"
+                     style="position:absolute;inset:0;border-radius:11px;transition:background .2s;border:1px solid rgba(255,255,255,.08);"></div>
+                <div :style="forceReextract ? 'left:18px' : 'left:2px'"
+                     style="position:absolute;top:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .2s;box-shadow:0 1px 3px rgba(0,0,0,.4);"></div>
+              </div>
+              <span style="font-size:13px;color:#94a3b8;">Force re-extract</span>
+            </label>
+            <span x-show="forceReextract" style="font-size:11px;color:#fca5a5;background:rgba(239,68,68,.08);padding:2px 8px;border-radius:4px;border:1px solid rgba(239,68,68,.2);">
+              Cached extraction will be deleted and the full pipeline will re-run
+            </span>
+          </div>
+
+          <!-- Start button -->
+          <button class="btn-primary mb-8"
+                  :disabled="!uploadFile || activeJob?.status==='running'"
+                  @click="startExtraction()">
+            <span x-show="activeJob?.status!=='running'">▶  Start Extraction</span>
+            <span x-show="activeJob?.status==='running'">⏳  Extraction in progress…</span>
+          </button>
+
+          <!-- Pipeline progress (shown once a job starts) -->
+          <div x-show="activeJob" class="card p-6 mb-5">
+            <div style="font-size:13px;font-weight:600;color:#f1f5f9;margin-bottom:20px;">Pipeline Progress</div>
+
+            <!-- Stage icons row -->
+            <div class="flex items-center mb-6" style="overflow-x:auto;padding-bottom:4px;">
+              <template x-for="([name,label],i) in stages" :key="name">
+                <div class="flex items-center" style="flex:1;min-width:0;">
+                  <div class="pipe-step" :class="`s-${activeJob?.stages?.[name]||'pending'}`">
+                    <div class="pipe-icon" x-text="i+1"></div>
+                    <div class="pipe-label" x-text="label.split(' ').slice(-1)[0]"></div>
+                  </div>
+                  <div x-show="i<stages.length-1"
+                       class="pipe-connector"
+                       :class="{done: activeJob?.stages?.[name]==='done'}"
+                       style="flex:1;min-width:8px;"></div>
+                </div>
+              </template>
+            </div>
+
+            <!-- Progress bar -->
+            <div class="prog-track mb-2">
+              <div class="prog-fill" :style="`width:${activeJob?.progress||0}%`"></div>
+            </div>
+            <div class="flex justify-between" style="font-size:12px;color:#475569;">
+              <span x-text="activeJob?.current_stage ? activeJob.current_stage.replace(/_/g,' ') : 'Waiting…'"></span>
+              <span x-text="(activeJob?.progress||0)+'%'"></span>
+            </div>
+          </div>
+
+          <!-- Live log -->
+          <div x-show="activeJob && logs.length>0" class="card p-4 mb-5">
+            <div class="flex items-center justify-between mb-3">
+              <div style="font-size:13px;font-weight:600;color:#f1f5f9;">Live Log</div>
+              <span style="font-size:11px;color:#334155;" x-text="logs.length+' entries'"></span>
+            </div>
+            <div class="log-box" x-ref="logBox">
+              <template x-for="(e,i) in logs" :key="i">
+                <div class="log-row">
+                  <span class="log-ts" x-text="e.ts.slice(11,19)"></span>
+                  <span class="log-lvl" :class="`lvl-${e.level}`" x-text="e.level.toUpperCase()"></span>
+                  <span class="log-stage" x-text="(e.stage||'').replace(/_/g,' ')"></span>
+                  <span class="log-msg" x-text="e.message"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Completion card -->
+          <div x-show="activeJob?.status==='completed'" class="card card-success p-6 mb-5">
+            <div class="flex items-center gap-3 mb-5">
+              <span style="font-size:28px;">✅</span>
+              <div>
+                <div style="font-size:15px;font-weight:700;color:#f1f5f9;">Extraction Complete</div>
+                <div style="font-size:13px;color:#475569;margin-top:2px;">Validation report generated successfully</div>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-4 mb-5">
+              <div style="text-align:center;">
+                <div style="font-size:26px;font-weight:800;color:#60a5fa;" x-text="activeJob?.metrics?.total_equations??'—'"></div>
+                <div style="font-size:11px;color:#475569;margin-top:4px;">Total Equations</div>
+              </div>
+              <div style="text-align:center;">
+                <div style="font-size:26px;font-weight:800;color:#34d399;" x-text="activeJob?.metrics ? activeJob.metrics.latex_generation_rate+'%' : '—'"></div>
+                <div style="font-size:11px;color:#475569;margin-top:4px;">LaTeX Generated</div>
+              </div>
+              <div style="text-align:center;">
+                <div style="font-size:26px;font-weight:800;color:#a78bfa;" x-text="activeJob?.metrics ? activeJob.metrics.latex_validity_rate+'%' : '—'"></div>
+                <div style="font-size:11px;color:#475569;margin-top:4px;">LaTeX Valid</div>
+              </div>
+            </div>
+            <button class="btn-primary" @click="viewReport(activeJobId)">Open Full Report →</button>
+          </div>
+
+          <!-- Failure card -->
+          <div x-show="activeJob?.status==='failed'" class="card card-error p-6 mb-5">
+            <div class="flex items-center gap-3">
+              <span style="font-size:28px;">❌</span>
+              <div>
+                <div style="font-size:15px;font-weight:700;color:#f1f5f9;">Extraction Failed</div>
+                <div style="font-size:13px;color:#f87171;margin-top:4px;" x-text="activeJob?.error||'Unknown error'"></div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div><!-- /extract -->
+
+      <!-- ════════════════════════════════════════════ REPORTS ═══════ -->
+      <div x-show="view==='reports'" style="height:calc(100vh - 56px);display:flex;flex-direction:column;">
+
+        <!-- Selector bar -->
+        <div class="flex items-center gap-4 px-6 py-3 flex-shrink-0"
+             style="border-bottom:1px solid rgba(255,255,255,.05);background:#0b1120;">
+          <span style="font-size:13px;color:#475569;flex-shrink:0;">Document:</span>
+
+          <select x-model="selectedJobId"
+                  style="background:#111827;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:6px 12px;font-size:13px;color:#e2e8f0;flex:1;max-width:420px;">
+            <option value="" disabled>— select a completed job —</option>
+            <template x-for="job in completedJobs" :key="job.id">
+              <option :value="job.id" x-text="job.filename + ' [' + job.id + ']'"></option>
+            </template>
+          </select>
+
+          <div x-show="selectedJobId && completedJobs.find(j=>j.id===selectedJobId)?.metrics"
+               class="flex gap-5 ml-2">
+            <span style="font-size:12px;color:#64748b;">
+              <span style="color:#60a5fa;font-weight:700;" x-text="completedJobs.find(j=>j.id===selectedJobId)?.metrics?.total_equations"></span>
+              equations extracted
+            </span>
+            <template x-if="completedJobs.find(j=>j.id===selectedJobId)?.metrics?.pdf_labeled_count > 0">
+              <span style="font-size:12px;color:#64748b;">
+                <span style="color:#f59e0b;font-weight:700;"
+                      x-text="completedJobs.find(j=>j.id===selectedJobId)?.metrics?.pdf_labeled_count"></span>
+                in PDF
+                <span x-show="completedJobs.find(j=>j.id===selectedJobId)?.metrics?.pdf_coverage_pct != null"
+                      style="color:#34d399;font-weight:700;"
+                      x-text="'('+( completedJobs.find(j=>j.id===selectedJobId)?.metrics?.pdf_coverage_pct??'')+'% coverage)'"></span>
+              </span>
+            </template>
+            <span style="font-size:12px;color:#64748b;">
+              <span style="color:#34d399;font-weight:700;" x-text="(completedJobs.find(j=>j.id===selectedJobId)?.metrics?.latex_validity_rate??0)+'%'"></span>
+              validity
+            </span>
+          </div>
+
+          <a x-show="selectedJobId && completedJobs.find(j=>j.id===selectedJobId)?.report_path"
+             :href="`/api/jobs/${selectedJobId}/report?v=${completedJobs.find(j=>j.id===selectedJobId)?.completed_at||''}`"
+             target="_blank"
+             style="font-size:12px;color:#5b9cf6;margin-left:auto;white-space:nowrap;">
+            Open in new tab ↗
+          </a>
+        </div>
+
+        <!-- ── AI QUALITY ASSESSMENT PANEL ─────────────────────────────────── -->
+        <template x-if="selectedJobId && completedJobs.find(j=>j.id===selectedJobId)?.metrics?.llm_coverage_verdict">
+          <div x-data="{ get m() { return completedJobs.find(j=>j.id===selectedJobId)?.metrics || {}; } }"
+               style="background:#0d1525;border-bottom:1px solid rgba(99,160,255,.12);flex-shrink:0;">
+
+            <!-- Panel header row -->
+            <div class="flex items-center gap-3 px-5 pt-3 pb-2" style="border-bottom:1px solid rgba(255,255,255,.04);">
+              <div style="width:7px;height:7px;border-radius:50%;background:#5b9cf6;flex-shrink:0;"></div>
+              <span style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.08em;">AI Quality Assessment — Vision LLM Judge</span>
+              <span class="tip-btn" data-tip="The configured vision model reviews each extracted equation image against the original PDF crop. Judge scores and verdicts are shown separately from rule-based metrics.">i</span>
+            </div>
+
+            <!-- Three-column body -->
+            <div class="flex" style="padding:14px 16px 16px;gap:0;overflow:visible;">
+
+              <!-- Col 1 – Coverage -->
+              <div style="flex:2.2;padding-right:20px;">
+                <div class="section-label">
+                  Extraction Coverage
+                  <span class="tip-btn" data-tip="Percentage of equations identified by PDF labels that were actually extracted. Partial = 70–94%, Complete ≥95%, Incomplete <70%.">i</span>
+                </div>
+                <div class="flex items-end gap-3 mb-2">
+                  <span style="font-size:30px;font-weight:800;line-height:1;"
+                        :style="(m.pdf_coverage_pct??0)>=95?'color:#10b981':(m.pdf_coverage_pct??0)>=70?'color:#f59e0b':'color:#ef4444'"
+                        x-text="m.pdf_coverage_pct!=null?m.pdf_coverage_pct+'%':'—'"></span>
+                  <span class="badge" style="margin-bottom:4px;"
+                        :class="m.llm_coverage_verdict==='complete'?'badge-complete':m.llm_coverage_verdict==='partial'?'badge-partial':m.llm_coverage_verdict==='unknown'?'badge-unknown':'badge-incomplete'"
+                        x-text="m.llm_coverage_verdict==='complete'?'✓ COMPLETE':m.llm_coverage_verdict==='partial'?'⚠ PARTIAL':m.llm_coverage_verdict==='unknown'?'— N/A':'✗ INCOMPLETE'">
+                  </span>
+                </div>
+                <div class="cov-track mb-2">
+                  <div class="cov-fill"
+                       :class="(m.pdf_coverage_pct??0)>=95?'cov-good':(m.pdf_coverage_pct??0)>=70?'cov-warn':'cov-bad'"
+                       :style="`width:${Math.min(m.pdf_coverage_pct||0,100)}%`"></div>
+                </div>
+                <div style="font-size:11.5px;color:#475569;margin-bottom:10px;"
+                     x-text="m.pdf_labeled_count>0?`${m.pdf_extracted_labeled_count??m.total_equations} extracted of ${m.pdf_labeled_count} labeled equations`:'—'"></div>
+                <!-- Missing equations — always visible -->
+                <template x-if="m.llm_missing_count > 0">
+                  <div>
+                    <div style="font-size:11px;color:#f87171;font-weight:600;margin-bottom:5px;"
+                         x-text="`Missing ${m.llm_missing_count} equation${m.llm_missing_count>1?'s':''}:`"></div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                      <template x-for="lbl in m.llm_missing_labels" :key="lbl">
+                        <span style="font-size:11px;background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.28);border-radius:4px;padding:1px 7px;"
+                              x-text="'Eq '+lbl"></span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+                <template x-if="m.pdf_labeled_count > 0 && !m.llm_missing_count">
+                  <div style="font-size:11px;color:#10b981;font-weight:600;">✓ All labeled equations extracted</div>
+                </template>
+                <template x-if="!m.pdf_labeled_count">
+                  <div style="font-size:11px;color:#64748b;">No equation number labels found in PDF text layer</div>
+                </template>
+              </div>
+
+              <div class="panel-divider"></div>
+
+              <!-- Col 2 – Verdict breakdown -->
+              <div style="flex:2;padding:0 20px;">
+                <div class="section-label">
+                  Verdict Breakdown
+                  <span class="tip-btn" data-tip="Accept and Reject are the configured judge's binary verdicts. Review is reserved for judged items without a definitive binary verdict; the three buckets are mutually exclusive.">i</span>
+                </div>
+                <template x-if="m.llm_total > 0">
+                  <div>
+                    <div class="vbar mb-3">
+                      <div class="vbar-accept" :style="`width:${m.llm_accepted/m.llm_total*100}%`"></div>
+                      <div class="vbar-review" :style="`width:${m.llm_reviewed/m.llm_total*100}%`"></div>
+                      <div class="vbar-reject" :style="`width:${m.llm_rejected/m.llm_total*100}%`"></div>
+                    </div>
+                    <div class="flex gap-4">
+                      <div style="text-align:center;">
+                        <div style="font-size:22px;font-weight:800;color:#10b981;" x-text="m.llm_accepted??'—'"></div>
+                        <div style="font-size:10.5px;color:#475569;margin-top:1px;">Accepted</div>
+                        <div style="font-size:10px;color:#334155;" x-text="m.llm_total?Math.round(m.llm_accepted/m.llm_total*100)+'%':''"></div>
+                      </div>
+                      <div style="text-align:center;">
+                        <div style="font-size:22px;font-weight:800;color:#f59e0b;" x-text="m.llm_reviewed??'—'"></div>
+                        <div style="font-size:10.5px;color:#475569;margin-top:1px;">Review</div>
+                        <div style="font-size:10px;color:#334155;" x-text="m.llm_total?Math.round(m.llm_reviewed/m.llm_total*100)+'%':''"></div>
+                      </div>
+                      <div style="text-align:center;">
+                        <div style="font-size:22px;font-weight:800;color:#ef4444;" x-text="m.llm_rejected??'—'"></div>
+                        <div style="font-size:10.5px;color:#475569;margin-top:1px;">Rejected</div>
+                        <div style="font-size:10px;color:#334155;" x-text="m.llm_total?Math.round(m.llm_rejected/m.llm_total*100)+'%':''"></div>
+                      </div>
+                      <div style="text-align:center;">
+                        <div style="font-size:22px;font-weight:800;color:#64748b;" x-text="m.llm_total??'—'"></div>
+                        <div style="font-size:10.5px;color:#475569;margin-top:1px;">Judged</div>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </div>
+
+              <div class="panel-divider"></div>
+
+              <!-- Col 3 – Quality scores -->
+              <div style="flex:1.8;padding-left:20px;">
+                <div class="section-label">
+                  Quality Scores
+                  <span class="tip-btn tip-left" data-tip="Overall is the judge score converted to 0–10. Confidence remains 0–100%. Relevance is shown only when the configured judge provides that field.">i</span>
+                </div>
+
+                <!-- Mean overall -->
+                <div style="margin-bottom:12px;">
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Overall Score</div>
+                  <div class="flex items-center gap-3">
+                    <span style="font-size:26px;font-weight:800;"
+                          :style="(m.llm_mean_overall??0)>=8?'color:#10b981':(m.llm_mean_overall??0)>=5?'color:#f59e0b':'color:#ef4444'"
+                          x-text="m.llm_mean_overall!=null?m.llm_mean_overall+'/10':'—'"></span>
+                    <div class="cov-track flex-1" style="height:6px;">
+                      <div class="cov-fill"
+                           :class="(m.llm_mean_overall??0)>=8?'cov-good':(m.llm_mean_overall??0)>=5?'cov-warn':'cov-bad'"
+                           :style="`width:${(m.llm_mean_overall??0)*10}%`"></div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Relevance -->
+                <div style="margin-bottom:9px;">
+                  <div class="flex items-center justify-between" style="margin-bottom:3px;">
+                    <span style="font-size:11px;color:#475569;">Relevance</span>
+                    <span style="font-size:12px;font-weight:700;"
+                          :style="(m.llm_mean_relevance??0)>=7?'color:#10b981':(m.llm_mean_relevance??0)>=4?'color:#f59e0b':'color:#ef4444'"
+                          x-text="m.llm_mean_relevance!=null?m.llm_mean_relevance+'/10':'—'"></span>
+                  </div>
+                  <div class="cov-track" style="height:5px;">
+                    <div class="cov-fill"
+                         :class="(m.llm_mean_relevance??0)>=7?'cov-good':(m.llm_mean_relevance??0)>=4?'cov-warn':'cov-bad'"
+                         :style="`width:${(m.llm_mean_relevance??0)*10}%`"></div>
+                  </div>
+                </div>
+
+                <!-- Confidence -->
+                <div>
+                  <div class="flex items-center justify-between" style="margin-bottom:3px;">
+                    <span style="font-size:11px;color:#475569;">Judge Confidence</span>
+                    <span style="font-size:12px;font-weight:700;color:#94a3b8;"
+                          x-text="m.llm_mean_confidence!=null?(m.llm_mean_confidence*100).toFixed(0)+'%':'—'"></span>
+                  </div>
+                  <div class="cov-track" style="height:5px;">
+                    <div class="cov-fill cov-good" :style="`width:${(m.llm_mean_confidence??0)*100}%`"></div>
+                  </div>
+                </div>
+
+              </div>
+
+            </div><!-- /3-col body -->
+          </div>
+        </template>
+
+        <!-- Empty state: nothing selected yet -->
+        <div x-show="!selectedJobId || completedJobs.length===0"
+             style="flex:1;display:flex;align-items:center;justify-content:center;">
+          <div style="text-align:center;color:#334155;">
+            <div style="font-size:40px;margin-bottom:12px;">📋</div>
+            <div style="font-size:14px;font-weight:500;color:#475569;margin-bottom:6px;">No report selected</div>
+            <div style="font-size:13px;">Complete an extraction job to view its report here.</div>
+          </div>
+        </div>
+
+        <!-- No-report state: job selected but report not ready -->
+        <div x-show="selectedJobId && completedJobs.length>0 && !completedJobs.find(j=>j.id===selectedJobId)?.report_path"
+             style="flex:1;display:flex;align-items:center;justify-content:center;">
+          <div style="text-align:center;color:#334155;">
+            <div style="font-size:40px;margin-bottom:12px;">⏳</div>
+            <div style="font-size:14px;font-weight:500;color:#475569;margin-bottom:6px;">Report not yet available</div>
+            <div style="font-size:13px;">The extraction is still running or the report file is missing.</div>
+          </div>
+        </div>
+
+        <!-- Report iframe — only loads when job has a confirmed report_path -->
+        <iframe x-show="selectedJobId && completedJobs.find(j=>j.id===selectedJobId)?.report_path"
+                x-effect="
+                  const job = completedJobs.find(j=>j.id===selectedJobId);
+                  $el.src = (job && job.report_path)
+                    ? `/api/jobs/${selectedJobId}/report?v=${job.completed_at||''}`
+                    : 'about:blank'
+                "
+                class="report-frame"
+                style="flex:1;"
+                title="Equation Validation Report">
+        </iframe>
+
+      </div><!-- /reports -->
+
+      <!-- ════════════════════════════════════════════ ANALYTICS ═════ -->
+      <div x-show="view==='analytics'" class="p-8">
+
+        <!-- No data -->
+        <div x-show="!latestMetrics" style="text-align:center;padding:80px 0;color:#334155;">
+          <div style="font-size:40px;margin-bottom:14px;">📊</div>
+          <div style="font-size:15px;font-weight:500;color:#475569;margin-bottom:6px;">No analytics data</div>
+          <div style="font-size:13px;">Complete an extraction to populate the charts.</div>
+        </div>
+
+        <div x-show="latestMetrics">
+
+          <!-- Summary KPIs -->
+          <div class="grid grid-cols-4 gap-4 mb-8">
+            <div class="metric-card text-center">
+              <div class="flex items-center justify-center gap-1" style="margin-bottom:6px;">
+                <span style="font-size:11px;color:#475569;">Total Equations</span>
+                <span class="tip-btn" data-tip="Aggregate equation count across all completed jobs. Includes display and inline equations.">i</span>
+              </div>
+              <div style="font-size:28px;font-weight:800;color:#60a5fa;" x-text="latestMetrics?.total_equations??0"></div>
+              <div style="font-size:10px;color:#334155;margin-top:3px;" x-text="(latestMetrics?.pages_with_equations??0)+' pages'"></div>
+            </div>
+            <div class="metric-card text-center">
+              <div class="flex items-center justify-center gap-1" style="margin-bottom:6px;">
+                <span style="font-size:11px;color:#475569;">LaTeX Generation</span>
+                <span class="tip-btn" data-tip="% of display equations converted to LaTeX. A drop indicates the OCR/recognition stage failed to produce structured math markup.">i</span>
+              </div>
+              <div style="font-size:28px;font-weight:800;color:#34d399;" x-text="(latestMetrics?.latex_generation_rate??0)+'%'"></div>
+            </div>
+            <div class="metric-card text-center">
+              <div class="flex items-center justify-center gap-1" style="margin-bottom:6px;">
+                <span style="font-size:11px;color:#475569;">LaTeX Validity</span>
+                <span class="tip-btn" data-tip="% of generated LaTeX that passes structural validation (balanced braces, known commands). Rule-based — does not guarantee semantic correctness.">i</span>
+              </div>
+              <div style="font-size:28px;font-weight:800;color:#a78bfa;" x-text="(latestMetrics?.latex_validity_rate??0)+'%'"></div>
+              <div style="font-size:10px;color:#334155;margin-top:3px;" x-text="(latestMetrics?.needs_review_count??0)+' need review'"></div>
+            </div>
+            <div class="metric-card text-center">
+              <div class="flex items-center justify-center gap-1" style="margin-bottom:6px;">
+                <span style="font-size:11px;color:#475569;">LaTeX Quality Score</span>
+                <span class="tip-btn tip-left" data-tip="Weighted rule-based quality score. Good ≥75%, Warn 50–74%, Fail <50%. Use alongside AI judge for the full picture.">i</span>
+              </div>
+              <div style="font-size:28px;font-weight:800;"
+                   :style="(latestMetrics?.latex_quality_score??0) >= 80 ? 'color:#10b981' : (latestMetrics?.latex_quality_score??0) >= 60 ? 'color:#f59e0b' : 'color:#ef4444'"
+                   x-text="(latestMetrics?.latex_quality_score??0)+'%'"></div>
+              <div style="font-size:10px;color:#334155;margin-top:3px;"
+                   x-text="latestMetrics?.quality_distribution ? `${latestMetrics.quality_distribution.good}✓ ${latestMetrics.quality_distribution.warn}~ ${latestMetrics.quality_distribution.fail}✗` : ''"></div>
+            </div>
+          </div>
+
+          <!-- LLM Judge summary (when data exists) -->
+          <template x-if="latestMetrics?.llm_total > 0">
+            <div class="health-panel mb-8">
+              <div class="section-label mb-4">
+                AI Judge Summary (aggregated across all jobs)
+                <span class="tip-btn" data-tip="Aggregated vision LLM judge results across all completed extraction jobs. Individual job breakdowns are available in the Reports tab.">i</span>
+              </div>
+              <div class="flex gap-8">
+                <div>
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Coverage</div>
+                  <span style="font-size:22px;font-weight:800;"
+                        :style="(latestMetrics.pdf_coverage_pct??0)>=95?'color:#10b981':(latestMetrics.pdf_coverage_pct??0)>=70?'color:#f59e0b':'color:#ef4444'"
+                        x-text="latestMetrics.pdf_coverage_pct!=null?latestMetrics.pdf_coverage_pct+'%':'—'"></span>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Accepted</div>
+                  <span style="font-size:22px;font-weight:800;color:#10b981;" x-text="latestMetrics.llm_accepted??'—'"></span>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Review</div>
+                  <span style="font-size:22px;font-weight:800;color:#f59e0b;" x-text="latestMetrics.llm_reviewed??'—'"></span>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Rejected</div>
+                  <span style="font-size:22px;font-weight:800;color:#ef4444;" x-text="latestMetrics.llm_rejected??'—'"></span>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">Avg Score</div>
+                  <span style="font-size:22px;font-weight:800;"
+                        :style="(latestMetrics.llm_mean_overall??0)>=8?'color:#10b981':(latestMetrics.llm_mean_overall??0)>=5?'color:#f59e0b':'color:#ef4444'"
+                        x-text="latestMetrics.llm_mean_overall!=null?latestMetrics.llm_mean_overall+'/10':'—'"></span>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <!-- 2×2 chart grid -->
+          <div class="grid grid-cols-2 gap-6">
+
+            <!-- Category distribution (donut) -->
+            <div class="card p-6">
+              <div class="flex items-center gap-2 mb-1">
+                <div style="font-size:13px;font-weight:600;color:#f1f5f9;">Equation Categories</div>
+                <span class="tip-btn" data-tip="Distribution by domain category (e.g. algebra, calculus, thermodynamics). Helps identify which subjects the document focuses on.">i</span>
+              </div>
+              <div style="font-size:12px;color:#475569;margin-bottom:20px;">Distribution across domain types</div>
+              <canvas x-ref="catChart" style="max-height:240px;"></canvas>
+            </div>
+
+            <!-- LaTeX quality breakdown (bar) -->
+            <div class="card p-6">
+              <div class="flex items-center gap-2 mb-1">
+                <div style="font-size:13px;font-weight:600;color:#f1f5f9;">LaTeX Extraction Quality</div>
+                <span class="tip-btn" data-tip="Funnel: Display Equations detected → LaTeX Generated → LaTeX Structurally Valid. Each drop reveals where the pipeline loses fidelity.">i</span>
+              </div>
+              <div style="font-size:12px;color:#475569;margin-bottom:20px;">Display equations through the extraction funnel</div>
+              <canvas x-ref="qualChart" style="max-height:240px;"></canvas>
+            </div>
+
+            <!-- Validation flags (horizontal bar) -->
+            <div class="card p-6">
+              <div class="flex items-center gap-2 mb-1">
+                <div style="font-size:13px;font-weight:600;color:#f1f5f9;">Validation Flags</div>
+                <span class="tip-btn" data-tip="Rule-based quality issues: label_only = only the equation number was extracted; truncated = content cut off; low_confidence = extraction uncertain; missing_latex = no LaTeX produced.">i</span>
+              </div>
+              <div style="font-size:12px;color:#475569;margin-bottom:20px;">Issues detected during quality analysis</div>
+              <canvas x-ref="flagChart" style="max-height:240px;"></canvas>
+            </div>
+
+            <!-- Quality distribution (donut) -->
+            <div class="card p-6">
+              <div class="flex items-center gap-2 mb-1">
+                <div style="font-size:13px;font-weight:600;color:#f1f5f9;">LaTeX Quality Distribution</div>
+                <span class="tip-btn tip-left" data-tip="Rule-based score tiers. Good ≥75%: well-formed LaTeX. Warning 50–74%: minor issues. Needs Fix <50%: likely OCR failure or label-only. Complement with AI verdict for full picture.">i</span>
+              </div>
+              <div style="font-size:12px;color:#475569;margin-bottom:20px;">Good ≥75% · Warning 50–74% · Fail &lt;50%</div>
+              <canvas x-ref="typeChart" style="max-height:240px;"></canvas>
+            </div>
+
+          </div>
+        </div>
+      </div><!-- /analytics -->
+
+    </div><!-- /scrollable content -->
+  </main>
+</div><!-- /flex layout -->
+
+<!-- ═══════════════════════════════════════════════════ ALPINE COMPONENT ══ -->
+<script>
+function dashboard() {
+  return {
+    view: 'overview',
+    jobs: [],
+    clockTime: '',
+
+    // Extract view
+    uploadFile: null,
+    forceReextract: false,
+    isDragging: false,
+    activeJobId: null,
+    activeJob:   null,
+    logs:        [],
+    _sse:        null,
+
+    // Reports view
+    selectedJobId: null,
+
+    // Chart instances
+    _charts: {},
+
+    // Static pipeline stage list (mirrors Python PIPELINE_STAGES)
+    stages: [
+      ['ingestion',          'Document Ingestion'],
+      ['classification',     'Document Classification'],
+      ['preprocessing',      'PDF Preprocessing'],
+      ['layout',             'Layout Analysis'],
+      ['reading_order',      'Reading Order Detection'],
+      ['text_extraction',    'Text Extraction'],
+      ['equation_extraction','Equation Extraction'],
+      ['validation',         'Equation Validation'],
+      ['report_generation',  'Report Generation'],
+    ],
+
+    /* ── Computed ─────────────────────────────────────────────────────── */
+    get viewTitle() {
+      return { overview:'Overview', extract:'New Extraction', reports:'Reports', analytics:'Analytics' }[this.view] || ''
+    },
+    get completedJobs() { return this.jobs.filter(j => j.status === 'completed') },
+
+    /* Aggregate metrics across ALL completed jobs so KPI cards show totals. */
+    get latestMetrics() {
+      const jobs = this.jobs.filter(j => j.metrics?.total_equations)
+      if (!jobs.length) return null
+
+      let totalEq = 0, displayEq = 0, inlineEq = 0, pagesWithEq = 0
+      let latexGen = 0, latexVal = 0, highConf = 0
+      let needsReview = 0, qualitySum = 0, qualityCount = 0
+      const cats = {}, flags = {}, qualityDist = { good: 0, warn: 0, fail: 0 }
+
+      // LLM / coverage aggregation
+      let totalLabeled = 0, totalExtracted = 0
+      let llmAccepted = 0, llmReviewed = 0, llmRejected = 0, llmTotal = 0
+      let llmOverallSum = 0, llmOverallCount = 0
+      let llmRelevanceSum = 0, llmRelevanceCount = 0, llmConfSum = 0, llmConfCount = 0
+
+      for (const j of jobs) {
+        const m = j.metrics
+        totalEq     += m.total_equations       || 0
+        displayEq   += m.display_equations     || 0
+        inlineEq    += m.inline_equations      || 0
+        pagesWithEq += m.pages_with_equations  || 0
+        needsReview += m.needs_review_count    || 0
+        totalLabeled   += m.pdf_labeled_count  || 0
+        totalExtracted += m.pdf_extracted_labeled_count ?? Math.min(m.total_equations || 0, m.pdf_labeled_count || 0)
+
+        const gen  = Math.round((m.display_equations || 0) * (m.latex_generation_rate || 0) / 100)
+        const val  = Math.round(gen * (m.latex_validity_rate  || 0) / 100)
+        const conf = Math.round((m.display_equations || 0) * (m.high_confidence_rate  || 0) / 100)
+        latexGen += gen; latexVal += val; highConf += conf
+
+        const qd = m.quality_distribution || {}
+        const qTotal = (qd.good || 0) + (qd.warn || 0) + (qd.fail || 0)
+        if (qTotal > 0 && m.latex_quality_score != null) {
+          qualitySum += m.latex_quality_score * qTotal; qualityCount += qTotal
+        }
+        for (const k of ['good', 'warn', 'fail']) qualityDist[k] += qd[k] || 0
+        for (const [k, v] of Object.entries(m.categories       || {})) cats[k]  = (cats[k]  || 0) + v
+        for (const [k, v] of Object.entries(m.validation_flags || {})) flags[k] = (flags[k] || 0) + v
+
+        llmAccepted  += m.llm_accepted  || 0
+        llmReviewed  += m.llm_reviewed  || 0
+        llmRejected  += m.llm_rejected  || 0
+        llmTotal     += m.llm_total     || 0
+        if (m.llm_mean_overall    != null) { llmOverallSum   += m.llm_mean_overall;    llmOverallCount++ }
+        if (m.llm_mean_relevance  != null) { llmRelevanceSum += m.llm_mean_relevance; llmRelevanceCount++ }
+        if (m.llm_mean_confidence != null) { llmConfSum      += m.llm_mean_confidence; llmConfCount++ }
+      }
+
+      const covPct     = totalLabeled > 0 ? +((totalExtracted / totalLabeled * 100).toFixed(1)) : null
+      const covVerdict = covPct == null ? null : covPct >= 95 ? 'complete' : covPct >= 70 ? 'partial' : 'incomplete'
+
+      return {
+        total_equations:       totalEq,
+        display_equations:     displayEq,
+        inline_equations:      inlineEq,
+        pages_with_equations:  pagesWithEq,
+        latex_generation_rate: displayEq ? +((latexGen / displayEq * 100).toFixed(1)) : 0,
+        latex_validity_rate:   latexGen  ? +((latexVal / latexGen  * 100).toFixed(1)) : 0,
+        high_confidence_rate:  displayEq ? +((highConf / displayEq * 100).toFixed(1)) : 0,
+        latex_quality_score:   qualityCount ? +((qualitySum / qualityCount).toFixed(1)) : 0,
+        needs_review_count:    needsReview,
+        quality_distribution:  qualityDist,
+        categories:            cats,
+        validation_flags:      flags,
+        // Coverage
+        pdf_labeled_count:     totalLabeled,
+        pdf_extracted_labeled_count: totalExtracted,
+        pdf_coverage_pct:      covPct,
+        llm_coverage_verdict:  covVerdict,
+        // LLM judge aggregate
+        llm_accepted:       llmTotal ? llmAccepted : null,
+        llm_reviewed:       llmTotal ? llmReviewed : null,
+        llm_rejected:       llmTotal ? llmRejected : null,
+        llm_total:          llmTotal,
+        llm_mean_overall:   llmOverallCount ? +((llmOverallSum  / llmOverallCount).toFixed(2)) : null,
+        llm_mean_relevance: llmRelevanceCount ? +((llmRelevanceSum / llmRelevanceCount).toFixed(2)) : null,
+        llm_mean_confidence:llmConfCount      ? +((llmConfSum / llmConfCount).toFixed(2))           : null,
+      }
+    },
+
+    /* ── Lifecycle ────────────────────────────────────────────────────── */
+    async init() {
+      await this.loadJobs()
+      setInterval(() => this.loadJobs(), 5000)
+      setInterval(() => { this.clockTime = new Date().toLocaleTimeString() }, 1000)
+      this.clockTime = new Date().toLocaleTimeString()
+    },
+
+    /* ── Data ─────────────────────────────────────────────────────────── */
+    async loadJobs() {
+      try {
+        const r = await fetch('/api/jobs')
+        if (r.ok) {
+          this.jobs = await r.json()
+          if (!this.selectedJobId && this.completedJobs.length > 0) {
+            this.selectedJobId = this.completedJobs[0].id
+          }
+        }
+      } catch(_) {}
+    },
+
+    /* ── Navigation ───────────────────────────────────────────────────── */
+    setView(v) {
+      this.view = v
+      if (v === 'analytics') this.$nextTick(() => this.renderCharts())
+    },
+
+    /* ── File handling ────────────────────────────────────────────────── */
+    handleDrop(e) {
+      this.isDragging = false
+      const f = e.dataTransfer?.files?.[0]
+      if (!f) return
+      if (!f.name.toLowerCase().endsWith('.pdf')) { alert('Please upload a PDF file.'); return }
+      this.uploadFile = f
+    },
+    handleFile(e) { this.uploadFile = e.target.files?.[0] || null },
+
+    /* ── Extraction ───────────────────────────────────────────────────── */
+    async startExtraction() {
+      if (!this.uploadFile) return
+      const form = new FormData()
+      form.append('file', this.uploadFile)
+      const url = '/api/jobs' + (this.forceReextract ? '?force=true' : '')
+      try {
+        const r = await fetch(url, { method: 'POST', body: form })
+        if (!r.ok) { alert('Upload failed: ' + r.statusText); return }
+        const data = await r.json()
+        this.activeJobId = data.id
+        this.activeJob   = { id: data.id, filename: data.filename, status: 'queued',
+                             progress: 0, stages: {}, current_stage: '', metrics: null, error: null }
+        this.logs = []
+        this.forceReextract = false   // reset after use
+        this._openSSE(data.id)
+      } catch(e) { alert('Network error: ' + e.message) }
+    },
+
+    _openSSE(jobId) {
+      if (this._sse) this._sse.close()
+      this._sse = new EventSource(`/api/jobs/${jobId}/events`)
+      this._sse.onmessage = (e) => {
+        const u = JSON.parse(e.data)
+        this.activeJob = { ...this.activeJob,
+          status:        u.status,
+          progress:      u.progress,
+          current_stage: u.current_stage,
+          stages:        u.stages,
+          metrics:       u.metrics ?? this.activeJob?.metrics,
+          error:         u.error,
+        }
+        if (u.new_logs?.length) {
+          this.logs.push(...u.new_logs)
+          this.$nextTick(() => {
+            const el = this.$refs.logBox
+            if (el) el.scrollTop = el.scrollHeight
+          })
+        }
+        if (u.status === 'completed' || u.status === 'failed') {
+          this._sse.close()
+          this.loadJobs()
+        }
+      }
+      this._sse.onerror = () => this._sse.close()
+    },
+
+    /* ── Formatting helpers ───────────────────────────────────────────── */
+    formatDuration(secs) {
+      if (secs == null) return '—'
+      if (secs < 60) return `${Math.round(secs)}s`
+      const m = Math.floor(secs / 60)
+      const s = Math.round(secs % 60)
+      return s > 0 ? `${m}m ${s}s` : `${m}m`
+    },
+
+    /* ── Actions ──────────────────────────────────────────────────────── */
+    watchJob(jobId) {
+      const job = this.jobs.find(j => j.id === jobId)
+      this.activeJobId = jobId
+      this.activeJob   = job ? { ...job } : null
+      this.logs        = job?.logs || []
+      this.view        = 'extract'
+      if (job?.status === 'running') this._openSSE(jobId)
+    },
+
+    viewReport(jobId) {
+      if (!jobId) return
+      this.selectedJobId = jobId
+      this.view = 'reports'
+    },
+
+    async rerunJob(jobId) {
+      const job = this.jobs.find(j => j.id === jobId)
+      if (!confirm(`Re-run extraction for "${job?.filename}"?\n\nCached outputs will be cleared and the full pipeline will run again from scratch.`)) return
+      try {
+        const r = await fetch(`/api/jobs/${jobId}/rerun`, { method: 'POST' })
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ detail: r.statusText }))
+          alert('Rerun failed: ' + (err.detail || r.statusText))
+          return
+        }
+        // Navigate to extract view and stream live progress for this job.
+        // Preserve metrics from the previous run so KPI cards don't flash to zero.
+        this.activeJobId = jobId
+        this.activeJob   = { ...(job || {}), status: 'queued', progress: 0,
+                              stages: {}, current_stage: '', error: null }
+        this.logs        = []
+        this.uploadFile  = null
+        this.view        = 'extract'
+        this._openSSE(jobId)
+      } catch(e) { alert('Network error: ' + e.message) }
+    },
+
+    async deleteJob(jobId, filename, status) {
+      const warning = status === 'running'
+        ? `Cancel and delete the running job for "${filename}"?\n\nThe extraction will be interrupted and all output files removed.`
+        : `Delete job for "${filename}"?\n\nThe PDF and all extracted data will be permanently removed from disk.`
+      if (!confirm(warning)) return
+      try {
+        const r = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' })
+        if (!r.ok) { alert('Delete failed: ' + r.statusText); return }
+        // Clear active job state if it was the deleted one
+        if (this.activeJobId === jobId) {
+          if (this._sse) { this._sse.close(); this._sse = null }
+          this.activeJobId = null
+          this.activeJob   = null
+          this.logs        = []
+        }
+        // Clear selected report if it was the deleted one
+        if (this.selectedJobId === jobId) this.selectedJobId = null
+        await this.loadJobs()
+      } catch (e) { alert('Network error: ' + e.message) }
+    },
+
+    /* ── Analytics charts ─────────────────────────────────────────────── */
+    renderCharts() {
+      const m = this.latestMetrics
+      if (!m) return
+
+      const PALETTE = ['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899']
+      const gridColor  = 'rgba(255,255,255,0.05)'
+      const tickColor  = '#475569'
+      const legendOpts = { labels: { color: '#64748b', font: { size: 11 }, boxWidth: 12 } }
+
+      const barAxes = {
+        x: { ticks: { color: tickColor, font: { size: 11 } }, grid: { color: gridColor } },
+        y: { ticks: { color: tickColor, font: { size: 11 } }, grid: { color: gridColor } },
+      }
+
+      /* 1. Category donut */
+      this._mk('catChart', 'doughnut', {
+        labels:   Object.keys(m.categories || {}),
+        datasets: [{ data: Object.values(m.categories || {}), backgroundColor: PALETTE, borderWidth: 0, hoverOffset: 6 }]
+      }, { cutout: '66%', plugins: { legend: { ...legendOpts, position: 'right' } } })
+
+      /* 2. LaTeX quality funnel (bar) */
+      const disp = m.display_equations || 0
+      const gen  = Math.round(disp * (m.latex_generation_rate || 0) / 100)
+      const val  = Math.round(gen  * (m.latex_validity_rate   || 0) / 100)
+      this._mk('qualChart', 'bar', {
+        labels:   ['Display Equations', 'LaTeX Generated', 'LaTeX Valid'],
+        datasets: [{ data: [disp, gen, val],
+                     backgroundColor: ['#3b82f6','#8b5cf6','#10b981'],
+                     borderRadius: 6, borderSkipped: false }]
+      }, { scales: barAxes, plugins: { legend: { display: false } } })
+
+      /* 3. Validation flags (horizontal bar) */
+      const flagKeys = Object.keys(m.validation_flags || {}).map(k => k.replace(/_/g,' '))
+      const flagVals = Object.values(m.validation_flags || {})
+      this._mk('flagChart', 'bar', {
+        labels:   flagKeys,
+        datasets: [{ data: flagVals, backgroundColor: '#ef4444', borderRadius: 5, borderSkipped: false }]
+      }, { indexAxis: 'y', scales: {
+            x: barAxes.x,
+            y: { ticks: { color: tickColor, font: { size: 10 } }, grid: { color: gridColor } }
+           }, plugins: { legend: { display: false } } })
+
+      /* 4. Quality distribution donut */
+      const qd = m.quality_distribution || {}
+      this._mk('typeChart', 'doughnut', {
+        labels:   ['Good (≥75%)', 'Warning (50–74%)', 'Needs Fix (<50%)'],
+        datasets: [{ data: [qd.good||0, qd.warn||0, qd.fail||0],
+                     backgroundColor: ['#10b981','#f59e0b','#ef4444'], borderWidth: 0, hoverOffset: 6 }]
+      }, { cutout: '66%', plugins: { legend: { ...legendOpts, position: 'right' } } })
+    },
+
+    _mk(ref, type, data, extra = {}) {
+      const canvas = this.$refs[ref]
+      if (!canvas) return
+      if (this._charts[ref]) { this._charts[ref].destroy(); delete this._charts[ref] }
+      this._charts[ref] = new Chart(canvas, {
+        type,
+        data,
+        options: { responsive: true, maintainAspectRatio: true, animation: { duration: 500 }, ...extra }
+      })
+    },
+  }
+}
+</script>
+</body>
+</html>

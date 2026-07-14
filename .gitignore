@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Downloaded ML models (currently about 1.2 GB)
+docling-models/
+
+# Local inputs and generated pipeline artifacts
+data/_cache/
+data/input/
+data/jobs/
+data/output/
+data/samples/
+data/validation/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/

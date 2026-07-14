@@ -1,0 +1,25 @@
+services:
+  pipeline:
+    build:
+      context: .
+      args:
+        PIP_TRUSTED_HOST: "pypi.org files.pythonhosted.org pypi.python.org"
+    volumes:
+      - ./data:/app/data
+      # Pre-downloaded Docling models; run `make download-models` once on the
+      # host to populate this directory, then rebuild/restart the container.
+      # If the directory is empty the container falls back to whatever was
+      # baked into the image during `docker build`.
+      - ./docling-models:/opt/docling-models:ro
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - DATA_DIR=/app/data
+      - DOCLING_ARTIFACTS_PATH=/opt/docling-models
+      - HF_HUB_OFFLINE=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - .env
+    ports:
+      - "8001:8000"
+    command: uvicorn others.dashboard.app:app --host 0.0.0.0 --port 8000

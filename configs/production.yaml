@@ -1,0 +1,16 @@
+# Production overrides — applies on top of base.yaml.
+
+rendering:
+  dpi_scanned: 300
+  dpi_digital: 216
+
+recognition:
+  retry_threshold: 0.7
+  max_retries: 3
+
+confidence:
+  min_acceptable: 0.65
+
+logging:
+  level: "INFO"
+  format: "json"

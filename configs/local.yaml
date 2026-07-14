@@ -1,0 +1,14 @@
+# Local development overrides — applies on top of base.yaml.
+# Copy to .env or set env vars instead for secrets.
+
+ollama:
+  base_url: "http://localhost:11434"
+  timeout: 60
+
+rendering:
+  dpi_scanned: 200
+  dpi_digital: 150
+
+logging:
+  level: "DEBUG"
+  format: "console"
