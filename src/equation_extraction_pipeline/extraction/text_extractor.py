@@ -524,6 +524,75 @@ def _compute_quality_score_preprocessing(image: Image.Image) -> float:
     return round(min(lap_var, 500.0) / 500.0, 4)
 
 
+def _enhance_page(rp: RenderedPage, modality: str) -> tuple[Image.Image, float]:
+    """Apply denoise / deskew / sharpen to a single page and return ``(image, quality)``."""
+    arr = _to_cv(rp.image)
+    arr = _denoise(arr, modality)
+
+    angle = _detect_skew_angle(arr)
+    if abs(angle) > config.DESKEW_THRESHOLD_DEG:
+        logger.debug("deskew page=%d angle=%.2f°", rp.page_number, angle)
+        arr = _deskew(arr, angle)
+
+    enhanced_image = _to_pil(arr)
+    enhanced_image = _sharpen(enhanced_image)
+    return enhanced_image, _compute_quality_score_preprocessing(enhanced_image)
+
+
+def render_and_preprocess_pages(
+    pdf_path: Path,
+    classification: ClassificationResult,
+    pages_dir: Path,
+) -> list[RenderedPage]:
+    """Render, enhance, and persist each page one at a time (flat-memory ingestion).
+
+    Streams pages through :func:`page_renderer.iter_rendered_pages`, enhances each
+    (denoise / deskew / sharpen), writes the result to ``pages_dir/page_NNN.png``, and
+    returns lightweight :class:`RenderedPage` objects whose pixels live on disk
+    (``image=None``, ``raster_path`` set). Downstream stages load rasters on demand via
+    :meth:`RenderedPage.load_image`, so peak memory stays bounded to a few pages
+    regardless of page count — unlike ``render_pages`` + ``preprocess_pages``, which
+    hold every raw and enhanced page in RAM simultaneously.
+    """
+    from equation_extraction_pipeline.extraction.page_renderer import iter_rendered_pages
+
+    pages_dir = Path(pages_dir)
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    modality = classification.modality
+    results: list[RenderedPage] = []
+
+    for rp in iter_rendered_pages(pdf_path, classification):
+        enhanced_image, new_quality = _enhance_page(rp, modality)
+        # Release the raw render immediately; only the enhanced page proceeds.
+        rp.image = None
+
+        raster_path = pages_dir / f"page_{rp.page_number:03d}.png"
+        enhanced_image.save(raster_path, format="PNG")
+
+        logger.debug(
+            "preprocess page=%d quality %.3f → %.3f",
+            rp.page_number,
+            rp.quality_score,
+            new_quality,
+        )
+        results.append(
+            RenderedPage(
+                page_number=rp.page_number,
+                image=None,
+                dpi=rp.dpi,
+                quality_score=new_quality,
+                width_px=rp.width_px,
+                height_px=rp.height_px,
+                raster_path=str(raster_path),
+            )
+        )
+        # Drop the enhanced raster from RAM; it is reloaded lazily from disk.
+        enhanced_image.close()
+
+    logger.info("render_preprocess_done pages=%d dir=%s", len(results), pages_dir)
+    return results
+
+
 def preprocess_pages(
     pages: list[RenderedPage],
     classification: ClassificationResult,

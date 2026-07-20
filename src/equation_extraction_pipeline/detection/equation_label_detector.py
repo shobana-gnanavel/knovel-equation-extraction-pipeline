@@ -1,47 +1,21 @@
-"""Equation label detector — merged module.
+"""Equation label detector.
 
-Sections
---------
-1. Classification signals         (from classifier/signals.py)
-   Page-level signals: text density, font metadata, image coverage,
-   render similarity.
-
-2. Language detection             (from classifier/language.py)
-   Optional langdetect backend with graceful degradation.
-
-3. Document signals               (from classifier/doc_signals.py)
-   Document-level signal collection over a sampled set of pages.
-
-4. Classification rules           (from classifier/doc_rules.py)
-   Pure deterministic rules: modality, layout complexity, category
-   scoring/selection, strategy recommendation.
-
-5. Page classifier                (from classifier/page_classifier.py)
-   Per-page digital/scanned/hybrid classification.
-
-6. Document classifier            (from classifier/doc_classifier.py)
-   Orchestrates signals → rules → language into ClassificationContext.
-
-7. Equation layout detection      (from layout_detection.py)
-   Label-scan (primary) and Docling ML (fallback) equation detection,
-   crop saving, and the public ``detect_equations`` entry point.
+Detects equation regions across all pages using label-scan (primary) and
+Docling ML (fallback) strategies, saves crops, and exposes the public
+``detect_equations`` entry point. Document/page *classification* lives in the
+sibling ``document_classifier`` module (its former Sections 1-6).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from collections import Counter
-from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from pathlib import Path
-from statistics import mean
+from typing import Any
 
-import structlog
 from pdfminer.converter import PDFPageAggregator
-from pdfminer.layout import LAParams, LTPage, LTTextBox
+from pdfminer.layout import LAParams, LTChar, LTPage, LTTextBox, LTTextLine
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 from PIL import Image
@@ -51,779 +25,24 @@ try:  # pragma: no cover - optional dependency handling
 except Exception:  # pragma: no cover - optional dependency handling
     np = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - optional dependency handling
-    from langdetect import DetectorFactory, detect_langs
-
-    DetectorFactory.seed = 0  # deterministic results (constitution VIII)
-except Exception:  # pragma: no cover - optional dependency handling
-    detect_langs = None
-
 from equation_extraction_pipeline.config import settings as config
 from equation_extraction_pipeline.domain.models import (
-    CategoryCandidate,
-    ClassificationContext,
     ClassificationResult,
-    DetectedLanguage,
-    DocumentMetadata,
     EquationRegion,
-    PageMeta,
     RenderedPage,
-)
-from equation_extraction_pipeline.extraction.ocr_extractor import OCR_AVAILABLE, ocr_text
-from equation_extraction_pipeline.ingestion.pdf_loader import (
-    PageView,
-    open_document,
-    render_page_image,
 )
 
 logger = logging.getLogger(__name__)
-_structlog = structlog.get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Section 1 — Classification signals  (from classifier/signals.py)
-# ---------------------------------------------------------------------------
-# Signals used to classify PDF pages and document regions.
-
-FAKE_FONTS = {
-    "",
-    "GlyphLessFont",
-    "Arial-BoldMT",
-    "ArialMT",
-    "FFIAEA+GlyphLessFont",
-}
+# Math-symbol probe used by image-math page flagging. Kept local to this module
+# so detection stays decoupled from document_classifier (which defines an
+# identical constant for its own signal collection).
+_MATH_SYMBOL = re.compile(r"[=±∑∫∂√≤≥≈×÷∞°µ]")
 
 __all__ = [
-    # signals
-    "TEXT_DENSITY",
-    "FONT_METADATA",
-    "IMAGE_COVERAGE",
-    "RENDER_SIMILARITY",
-    # language
-    "LANGDETECT_AVAILABLE",
-    "LanguageResult",
-    "detect_languages",
-    # doc_signals
-    "DocumentSignals",
-    "sample_pages",
-    "estimate_columns",
-    "collect_signals",
-    # doc_rules
-    "determine_modality",
-    "assess_layout_complexity",
-    "score_categories",
-    "select_category",
-    "recommend_strategy",
-    # page_classifier
-    "classify_page",
-    # doc_classifier
-    "classify_document",
-    # layout detection
     "detect_equations",
     "scan_equation_labels",
 ]
-
-
-def _signal_text_density(page: PageView) -> tuple[int, list[str]]:
-    words = page.get_text("words")
-    word_count = len(words)
-    signals_used = ["text_density"]
-    return word_count, signals_used
-
-
-def _signal_font_metadata(page: PageView) -> tuple[bool, list[str]]:
-    rawdict = page.get_text("rawdict")
-    fonts: set[str] = set()
-
-    for block in rawdict.get("blocks", []):
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                font_name = span.get("font")
-                if font_name is not None:
-                    fonts.add(font_name)
-
-    has_real_fonts = any(font not in FAKE_FONTS for font in fonts)
-    signals_used = ["font_metadata"]
-    return has_real_fonts, signals_used
-
-
-def _signal_image_coverage(page: PageView) -> tuple[float, list[str]]:
-    images = page.get_image_info()
-    page_area = page.rect.width * page.rect.height
-    if page_area == 0:
-        return 0.0, ["image_coverage"]
-
-    covered = sum(
-        abs((image["bbox"][2] - image["bbox"][0]) * (image["bbox"][3] - image["bbox"][1]))
-        for image in images
-    )
-    coverage = min(covered / page_area, 1.0)
-    return coverage, ["image_coverage"]
-
-
-def _signal_render_similarity(page: PageView, embedded_text: str) -> tuple[float, list[str]]:
-    if np is None or not OCR_AVAILABLE:
-        return 0.5, ["render_similarity_skipped"]
-
-    image = render_page_image(page)
-
-    height, width = image.shape[:2]
-    crop = image[height // 3 : 2 * height // 3, width // 3 : 2 * width // 3]
-
-    recognized = ocr_text(crop)
-    similarity = SequenceMatcher(None, embedded_text, recognized).ratio()
-    return similarity, ["render_similarity"]
-
-
-TEXT_DENSITY = _signal_text_density
-FONT_METADATA = _signal_font_metadata
-IMAGE_COVERAGE = _signal_image_coverage
-RENDER_SIMILARITY = _signal_render_similarity
-
-
-# ---------------------------------------------------------------------------
-# Section 2 — Language detection  (from classifier/language.py)
-# ---------------------------------------------------------------------------
-# Pluggable language-detection backend for document classification.
-# The optional library import is guarded; when absent the stage degrades
-# to a deterministic stdlib heuristic and records the degradation.
-
-LANGDETECT_AVAILABLE = detect_langs is not None
-
-
-@dataclass
-class LanguageResult:
-    """Ranked detected languages plus any degradation note."""
-
-    languages: list[DetectedLanguage] = field(default_factory=list)
-    degraded: bool = False
-    note: str | None = None
-
-
-def _undetermined(degraded: bool, note: str | None) -> LanguageResult:
-    return LanguageResult(
-        languages=[DetectedLanguage(language="und", confidence=0.0)],
-        degraded=degraded,
-        note=note,
-    )
-
-
-def _detect_with_library(text: str, min_confidence: float) -> LanguageResult:
-    """Use the optional langdetect backend; sorted desc, filtered by ``min_confidence``."""
-    try:
-        ranked = detect_langs(text)
-    except Exception:
-        return _undetermined(degraded=False, note="no_language_features")
-
-    languages = [
-        DetectedLanguage(language=str(item.lang), confidence=float(item.prob))
-        for item in ranked
-        if float(item.prob) >= min_confidence
-    ]
-    languages.sort(key=lambda detected: (-detected.confidence, detected.language))
-    if not languages:
-        return _undetermined(degraded=False, note="below_min_confidence")
-    return LanguageResult(languages=languages, degraded=False, note=None)
-
-
-def detect_languages(
-    text: str,
-    *,
-    backend: str = "default",
-    min_confidence: float = 0.10,
-) -> LanguageResult:
-    """Detect language(s) in ``text``, returning a ranked :class:`LanguageResult`.
-
-    ``backend == "none"`` (or an unavailable library) yields a degraded ``und`` result.
-    Empty/whitespace text yields ``und`` without marking degradation (no signal to detect).
-    """
-    if not text or not text.strip():
-        return _undetermined(degraded=False, note="empty_text")
-
-    if backend == "none" or not LANGDETECT_AVAILABLE:
-        return _undetermined(degraded=True, note="language_backend_unavailable")
-
-    return _detect_with_library(text, min_confidence)
-
-
-# ---------------------------------------------------------------------------
-# Section 3 — Document signals  (from classifier/doc_signals.py)
-# ---------------------------------------------------------------------------
-# Aggregates per-page classification results plus lightweight structural
-# signals and a bounded prose sample for language detection.
-
-_MAX_PROSE_CHARS = 4000
-_NUMERIC_TOKEN = re.compile(r"\d")
-_MATH_SYMBOL = re.compile(r"[=±∑∫∂√≤≥≈×÷∞°µ]")
-
-
-@dataclass
-class DocumentSignals:
-    """Collected document-level signals feeding the classification rules."""
-
-    total_pages: int = 0
-    sampled_pages: list[int] = field(default_factory=list)
-    sample_strategy: str = "stratified"
-    page_type_counts: dict[str, int] = field(default_factory=dict)
-    has_text_layer: bool = False
-    multi_column: bool = False
-    column_estimate: int = 1
-    table_density: float = 0.0
-    figure_density: float = 0.0
-    equation_density: float = 0.0
-    word_count_mean: float = 0.0
-    prose_text: str = ""
-    metadata: dict[str, str] = field(default_factory=dict)
-    signals_used: list[str] = field(default_factory=list)
-
-
-def sample_pages(total_pages: int, strategy: str, cap: int) -> list[int]:
-    """Return a deterministic list of page indices to analyze.
-
-    ``total_pages <= cap`` → every page.  Otherwise a stratified, evenly-spaced
-    sample of ``cap`` pages that always includes the first and last page.  Any
-    unknown strategy falls back to ``stratified`` so the caller always gets a
-    valid, repeatable sample.
-    """
-    if total_pages <= 0:
-        return []
-    if cap <= 0 or total_pages <= cap:
-        return list(range(total_pages))
-
-    if strategy not in {"stratified", "all"}:
-        strategy = "stratified"
-    if strategy == "all":
-        return list(range(total_pages))
-
-    step = (total_pages - 1) / (cap - 1)
-    indices = sorted({int(round(i * step)) for i in range(cap)})
-    return indices
-
-
-def estimate_columns(block_x_centers: list[float], page_width: float) -> int:
-    """Estimate the number of text columns from block horizontal centers.
-
-    Reports 2 columns when each half holds a meaningful share (≥ 25%) of
-    blocks, else 1.  Deterministic and dependency-free.
-    """
-    if page_width <= 0 or len(block_x_centers) < 4:
-        return 1
-    mid = page_width / 2.0
-    left = sum(1 for x in block_x_centers if x < mid)
-    right = len(block_x_centers) - left
-    total = left + right
-    if total == 0:
-        return 1
-    if min(left, right) / total >= 0.25:
-        return 2
-    return 1
-
-
-def _page_density_indicators(text: str) -> tuple[float, float]:
-    """Return (numeric-line ratio, math-symbol-line ratio) for a page's text."""
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
-        return 0.0, 0.0
-    numeric = sum(1 for line in lines if len(_NUMERIC_TOKEN.findall(line)) >= 3)
-    mathy = sum(1 for line in lines if _MATH_SYMBOL.search(line))
-    return numeric / len(lines), mathy / len(lines)
-
-
-def collect_signals(
-    pdf_path: Path,
-    *,
-    page_manifest: list[PageMeta],
-    metadata: DocumentMetadata | None,
-    strategy: str,
-    cap: int,
-    column_threshold: int,
-) -> DocumentSignals:
-    """Open the document over the sampled pages and assemble :class:`DocumentSignals`."""
-    total_pages = len(page_manifest)
-    sampled = sample_pages(total_pages, strategy, cap)
-    signals = DocumentSignals(
-        total_pages=total_pages,
-        sampled_pages=sampled,
-        sample_strategy=strategy,
-        metadata=dict(metadata.raw) if metadata is not None else {},
-        signals_used=["page_modality_aggregate"],
-    )
-    if not sampled:
-        return signals
-
-    page_type_counts: Counter[str] = Counter()
-    word_counts: list[int] = []
-    has_text_layer = False
-    image_coverages: list[float] = []
-    for index in sampled:
-        meta = page_manifest[index]
-        page_type_counts[meta.page_type] += 1
-        word_counts.append(meta.word_count)
-        image_coverages.append(meta.image_coverage)
-        if meta.word_count > 0 and meta.has_real_fonts:
-            has_text_layer = True
-    signals.page_type_counts = dict(page_type_counts)
-    signals.has_text_layer = has_text_layer
-    signals.figure_density = (
-        sum(image_coverages) / len(image_coverages) if image_coverages else 0.0
-    )
-    signals.word_count_mean = sum(word_counts) / len(word_counts) if word_counts else 0.0
-
-    prose_parts: list[str] = []
-    max_columns = 1
-    table_ratios: list[float] = []
-    math_ratios: list[float] = []
-    try:
-        with open_document(str(pdf_path)) as document:
-            for index in sampled:
-                if index >= len(document):
-                    continue
-                page = document[index]
-                text = page.get_text("text") or ""
-                if len(" ".join(prose_parts)) < _MAX_PROSE_CHARS:
-                    prose_parts.append(text)
-                table_ratio, math_ratio = _page_density_indicators(text)
-                table_ratios.append(table_ratio)
-                math_ratios.append(math_ratio)
-
-                rawdict = page.get_text("dict") or {}
-                centers = [
-                    (float(block["bbox"][0]) + float(block["bbox"][2])) / 2.0
-                    for block in rawdict.get("blocks", [])
-                    if block.get("type", 0) == 0 and block.get("bbox")
-                ]
-                max_columns = max(max_columns, estimate_columns(centers, page.rect.width))
-        signals.signals_used.extend(["block_columns", "content_density"])
-    except Exception as exc:
-        _structlog.warning("doc_signal_collection_degraded", pdf=str(pdf_path), error=str(exc))
-        signals.signals_used.append("structural_signals_skipped")
-
-    signals.column_estimate = max_columns
-    signals.multi_column = max_columns >= column_threshold
-    signals.table_density = sum(table_ratios) / len(table_ratios) if table_ratios else 0.0
-    signals.equation_density = sum(math_ratios) / len(math_ratios) if math_ratios else 0.0
-    signals.prose_text = " ".join(prose_parts)[:_MAX_PROSE_CHARS]
-    if metadata is not None:
-        signals.signals_used.append("metadata_cues")
-    return signals
-
-
-# ---------------------------------------------------------------------------
-# Section 4 — Classification rules  (from classifier/doc_rules.py)
-# ---------------------------------------------------------------------------
-# Pure, deterministic classification rules. All functions are side-effect
-# free and operate on plain data so they are trivially unit-testable.
-
-_MODALITY_DEFAULT_STRATEGY = {
-    "digital": "digital_text_first",
-    "scanned": "ocr_first",
-    "hybrid": "hybrid_per_page_routed",
-}
-
-_CATEGORY_KEYWORDS = {
-    "textbook": ("textbook", "introduction to", "lecture", "edition"),
-    "reference_handbook": ("handbook", "reference", "encyclopedia", "manual"),
-    "journal_article": ("journal", "doi", "abstract", "vol."),
-    "conference_paper": ("proceedings", "conference", "symposium", "workshop"),
-    "technical_report": ("report", "technical memorandum", "white paper"),
-    "standard_specification": ("standard", "specification", "iso ", "astm", "ansi", "ieee std"),
-    "datasheet": ("datasheet", "data sheet", "product specification"),
-    "patent": ("patent", "claims", "united states patent", "application no"),
-}
-
-
-def determine_modality(
-    page_type_counts: dict[str, int],
-    *,
-    digital_threshold: float,
-    scanned_threshold: float,
-) -> tuple[str, float, dict[str, float]]:
-    """Aggregate per-page modality into a document modality with banding (FR-002).
-
-    Returns ``(modality, confidence, proportions)``.  ``hybrid`` is the mixed
-    band when neither digital nor scanned share clears its threshold.
-    """
-    total = sum(page_type_counts.values())
-    if total == 0:
-        return "scanned", 0.0, {}
-
-    proportions = {
-        ptype: round(count / total, 6)
-        for ptype, count in sorted(page_type_counts.items())
-    }
-    digital = proportions.get("digital", 0.0)
-    scanned = proportions.get("scanned", 0.0)
-
-    if digital >= digital_threshold:
-        return "digital", digital, proportions
-    if scanned >= scanned_threshold:
-        return "scanned", scanned, proportions
-    confidence = round(1.0 - max(digital, scanned), 6)
-    return "hybrid", confidence, proportions
-
-
-def assess_layout_complexity(
-    *,
-    multi_column: bool,
-    table_density: float,
-    figure_density: float,
-    equation_density: float,
-    moderate_density: float,
-    complex_density: float,
-) -> tuple[str, float]:
-    """Map column structure + content density to a complexity level (FR-005)."""
-    density = max(table_density, figure_density, equation_density)
-    if multi_column or density >= complex_density:
-        if density >= complex_density or (multi_column and density >= moderate_density):
-            return "complex", round(min(1.0, 0.6 + density), 6)
-        return "moderate", round(min(1.0, 0.5 + density), 6)
-    if density >= moderate_density:
-        return "moderate", round(min(1.0, 0.5 + density), 6)
-    return "simple", round(min(1.0, 0.7 + (moderate_density - density)), 6)
-
-
-def _category_raw_score(category: str, signals: DocumentSignals) -> float:
-    """Heuristic non-negative score for a single category from document signals."""
-    title = (
-        signals.metadata.get("Title", "") + " " + signals.metadata.get("title", "")
-    ).lower()
-    keywords = _CATEGORY_KEYWORDS.get(category, ())
-    keyword_hits = sum(1 for kw in keywords if kw in title)
-    score = 2.5 * keyword_hits
-
-    pages = signals.total_pages
-    if category == "textbook":
-        score += 1.0 if pages >= 150 else 0.2
-        score += 0.4 if signals.equation_density >= 0.05 else 0.0
-    elif category == "reference_handbook":
-        score += 1.0 if (pages >= 200 and signals.table_density >= 0.15) else 0.2
-    elif category == "journal_article":
-        score += 1.0 if (pages <= 40 and signals.multi_column) else 0.1
-    elif category == "conference_paper":
-        score += 0.9 if (pages <= 30 and signals.multi_column) else 0.1
-        score += 0.3 if signals.figure_density >= 0.1 else 0.0
-    elif category == "technical_report":
-        score += 0.6 if 20 <= pages <= 200 else 0.2
-    elif category == "standard_specification":
-        score += 0.5 if signals.table_density >= 0.1 else 0.1
-    elif category == "datasheet":
-        score += 1.0 if (pages <= 20 and signals.table_density >= 0.25) else 0.1
-    elif category == "patent":
-        score += 0.4
-    return max(0.0, score)
-
-
-def score_categories(
-    signals: DocumentSignals, taxonomy: list[str]
-) -> list[CategoryCandidate]:
-    """Score every taxonomy category and return candidates sorted by confidence desc.
-
-    Confidence is each category's share of the total score (relative), so a
-    flat distribution yields low confidences that fall back to ``unknown``
-    downstream (FR-003).
-    """
-    raw = {category: _category_raw_score(category, signals) for category in taxonomy}
-    total = sum(raw.values())
-    if total <= 0:
-        return []
-    candidates = [
-        CategoryCandidate(category=category, confidence=round(score / total, 6))
-        for category, score in raw.items()
-        if score > 0
-    ]
-    candidates.sort(key=lambda c: (-c.confidence, c.category))
-    return candidates
-
-
-def select_category(
-    candidates: list[CategoryCandidate],
-    *,
-    threshold: float,
-    margin: float,
-) -> tuple[str, float, str | None]:
-    """Pick the top category if it clears threshold AND beats the runner-up by margin.
-
-    Returns ``(category, confidence, fallback_reason)``; ``fallback_reason`` is
-    non-None exactly when the result is ``unknown`` (FR-003).
-    """
-    if not candidates:
-        return "unknown", 0.0, "insufficient_signal"
-    top = candidates[0]
-    if top.confidence < threshold:
-        return "unknown", top.confidence, "below_threshold"
-    runner_up = candidates[1].confidence if len(candidates) > 1 else 0.0
-    if (top.confidence - runner_up) < margin:
-        return "unknown", top.confidence, "below_margin"
-    return top.category, top.confidence, None
-
-
-def recommend_strategy(
-    *,
-    modality: str,
-    category: str,
-    layout_complexity: str,
-    strategy_map_json: str,
-    default_strategy: str,
-) -> str:
-    """Map (modality, category, layout) → a defined strategy id; always returns one (FR-007).
-
-    Lookup order: exact ``"<modality>|<category>|<layout>"`` → ``"<modality>"``
-    → the per-modality built-in default → ``default_strategy``.
-    """
-    try:
-        strategy_map = json.loads(strategy_map_json) if strategy_map_json else {}
-        if not isinstance(strategy_map, dict):
-            strategy_map = {}
-    except (ValueError, TypeError):
-        strategy_map = {}
-
-    exact = f"{modality}|{category}|{layout_complexity}"
-    if exact in strategy_map:
-        return str(strategy_map[exact])
-    if modality in strategy_map:
-        return str(strategy_map[modality])
-    return _MODALITY_DEFAULT_STRATEGY.get(modality, default_strategy)
-
-
-# ---------------------------------------------------------------------------
-# Section 5 — Page classifier  (from classifier/page_classifier.py)
-# ---------------------------------------------------------------------------
-# Page classification logic for digital, scanned, and hybrid PDFs.
-
-
-def classify_page(page: PageView, page_no: int) -> PageMeta:
-    """Classify a single PDF page as digital, scanned, or hybrid."""
-    try:
-        word_count, signals_used = TEXT_DENSITY(page)
-        has_real_fonts, font_signals = FONT_METADATA(page)
-        image_coverage, image_signals = IMAGE_COVERAGE(page)
-        signals_used = signals_used + font_signals + image_signals
-
-        page_type: str
-        confidence: float
-        render_similarity: float | None = None
-
-        if (
-            word_count > config.CLASSIFIER_WORD_COUNT_THRESHOLD
-            and has_real_fonts
-            and image_coverage < 0.30
-        ):
-            page_type = "digital"
-            confidence = 0.95
-        elif (
-            word_count > config.CLASSIFIER_WORD_COUNT_THRESHOLD
-            and has_real_fonts
-            and 0.30 <= image_coverage < config.CLASSIFIER_IMAGE_COVERAGE_THRESHOLD
-        ):
-            embedded_text = page.get_text("text")
-            render_similarity, render_signals = RENDER_SIMILARITY(page, embedded_text)
-            signals_used += render_signals
-            if render_similarity > config.CLASSIFIER_RENDER_SIMILARITY_THRESHOLD:
-                page_type = "digital"
-                confidence = render_similarity
-            elif render_similarity < config.CLASSIFIER_AMBIGUOUS_LOWER:
-                page_type = "scanned"
-                confidence = 1 - render_similarity
-            else:
-                page_type = "hybrid"
-                confidence = 0.65
-        elif word_count > config.CLASSIFIER_WORD_COUNT_THRESHOLD and not has_real_fonts:
-            page_type = "hybrid"
-            confidence = 0.75
-        elif (
-            word_count <= config.CLASSIFIER_WORD_COUNT_THRESHOLD
-            and image_coverage >= config.CLASSIFIER_IMAGE_COVERAGE_THRESHOLD
-        ):
-            page_type = "scanned"
-            confidence = 0.92
-        else:
-            page_type = "scanned"
-            confidence = 0.70
-
-        return PageMeta(
-            page_no=page_no,
-            page_type=page_type,
-            word_count=word_count,
-            has_real_fonts=has_real_fonts,
-            image_coverage=image_coverage,
-            render_similarity=render_similarity,
-            orientation=page.rotation,
-            classification_confidence=confidence,
-            signals_used=signals_used,
-        )
-    except Exception:
-        return PageMeta(
-            page_no=page_no,
-            page_type="scanned",
-            word_count=0,
-            has_real_fonts=False,
-            image_coverage=0.0,
-            render_similarity=None,
-            orientation=page.rotation if hasattr(page, "rotation") else 0,
-            classification_confidence=0.0,
-            signals_used=["error_fallback"],
-        )
-
-
-# ---------------------------------------------------------------------------
-# Section 6 — Document classifier  (from classifier/doc_classifier.py)
-# ---------------------------------------------------------------------------
-# Orchestrates signal collection → rules → language detection into a single
-# ClassificationContext. Per-document failures are contained (outcome="failed")
-# and analyzer unavailability degrades gracefully (outcome="degraded").
-
-
-def _taxonomy() -> list[str]:
-    return [
-        c.strip()
-        for c in config.CLASSIFIER_DOC_CATEGORIES.split(",")
-        if c.strip()
-    ]
-
-
-def classify_document(
-    pdf_path: Path,
-    *,
-    page_manifest: list[PageMeta],
-    metadata: DocumentMetadata | None,
-    config_hash: str = "",
-) -> ClassificationContext:
-    """Produce the document-level Classification Context for ``pdf_path``."""
-    try:
-        signals = collect_signals(
-            pdf_path,
-            page_manifest=page_manifest,
-            metadata=metadata,
-            strategy=config.CLASSIFIER_DOC_PAGE_SAMPLE_STRATEGY,
-            cap=config.CLASSIFIER_DOC_PAGE_SAMPLE_CAP,
-            column_threshold=config.CLASSIFIER_DOC_LAYOUT_COLUMN_THRESHOLD,
-        )
-
-        modality, modality_conf, proportions = determine_modality(
-            signals.page_type_counts,
-            digital_threshold=config.CLASSIFIER_DOC_MODALITY_DIGITAL_THRESHOLD,
-            scanned_threshold=config.CLASSIFIER_DOC_MODALITY_SCANNED_THRESHOLD,
-        )
-
-        layout, layout_conf = assess_layout_complexity(
-            multi_column=signals.multi_column,
-            table_density=signals.table_density,
-            figure_density=signals.figure_density,
-            equation_density=signals.equation_density,
-            moderate_density=config.CLASSIFIER_DOC_LAYOUT_MODERATE_DENSITY,
-            complex_density=config.CLASSIFIER_DOC_LAYOUT_COMPLEX_DENSITY,
-        )
-
-        candidates = score_categories(signals, _taxonomy())
-        category, category_conf, fallback_reason = select_category(
-            candidates,
-            threshold=config.CLASSIFIER_DOC_CATEGORY_THRESHOLD,
-            margin=config.CLASSIFIER_DOC_CATEGORY_MARGIN,
-        )
-
-        language_result = detect_languages(
-            signals.prose_text,
-            backend=config.CLASSIFIER_DOC_LANGUAGE_BACKEND,
-            min_confidence=config.CLASSIFIER_DOC_LANGUAGE_MIN_CONFIDENCE,
-        )
-        detected = language_result.languages
-        dominant = detected[0].language if detected else "und"
-
-        strategy = recommend_strategy(
-            modality=modality,
-            category=category,
-            layout_complexity=layout,
-            strategy_map_json=config.CLASSIFIER_DOC_STRATEGY_MAP,
-            default_strategy=config.CLASSIFIER_DOC_STRATEGY_DEFAULT,
-        )
-
-        signals_used = list(signals.signals_used)
-        if detected and dominant != "und":
-            signals_used.append("language_backend")
-
-        outcome = "classified"
-        degradation_notes: list[str] = []
-        if language_result.degraded:
-            outcome = "degraded"
-            if language_result.note:
-                degradation_notes.append(language_result.note)
-
-        verdict_confidences = [modality_conf, layout_conf]
-        if category != "unknown":
-            verdict_confidences.append(category_conf)
-        if detected and dominant != "und":
-            verdict_confidences.append(detected[0].confidence)
-        overall = round(mean(verdict_confidences), 6) if verdict_confidences else 0.0
-
-        context = ClassificationContext(
-            modality=modality,
-            modality_confidence=round(modality_conf, 6),
-            page_type_proportions=proportions,
-            category=category,
-            category_confidence=round(category_conf, 6),
-            category_candidates=candidates,
-            category_fallback_reason=fallback_reason,
-            dominant_language=dominant,
-            detected_languages=detected,
-            layout_complexity=layout,
-            layout_confidence=round(layout_conf, 6),
-            characteristics={
-                "page_count": signals.total_pages,
-                "has_text_layer": signals.has_text_layer,
-                "multi_column": signals.multi_column,
-                "column_estimate": signals.column_estimate,
-                "table_density": round(signals.table_density, 6),
-                "figure_density": round(signals.figure_density, 6),
-                "equation_density": round(signals.equation_density, 6),
-                "word_count_mean": round(signals.word_count_mean, 6),
-            },
-            recommended_strategy=strategy,
-            overall_confidence=overall,
-            sampling={
-                "strategy": signals.sample_strategy,
-                "cap": config.CLASSIFIER_DOC_PAGE_SAMPLE_CAP,
-                "total_pages": signals.total_pages,
-                "sampled_pages": signals.sampled_pages,
-            },
-            signals_used=signals_used,
-            outcome=outcome,
-            degradation_notes=degradation_notes,
-            config_hash=config_hash,
-        )
-        _structlog.info(
-            "document_classified",
-            pdf=str(pdf_path),
-            modality=modality,
-            category=category,
-            dominant_language=dominant,
-            layout_complexity=layout,
-            recommended_strategy=strategy,
-            overall_confidence=overall,
-            outcome=outcome,
-        )
-        return context
-    except Exception as exc:
-        _structlog.error(
-            "document_classification_failed", pdf=str(pdf_path), error=str(exc)
-        )
-        strategy = recommend_strategy(
-            modality="scanned",
-            category="unknown",
-            layout_complexity="simple",
-            strategy_map_json=config.CLASSIFIER_DOC_STRATEGY_MAP,
-            default_strategy=config.CLASSIFIER_DOC_STRATEGY_DEFAULT,
-        )
-        return ClassificationContext(
-            modality="scanned",
-            category="unknown",
-            category_fallback_reason="insufficient_signal",
-            dominant_language="und",
-            layout_complexity="simple",
-            recommended_strategy=strategy,
-            overall_confidence=0.0,
-            outcome="failed",
-            degradation_notes=["classification_error"],
-            config_hash=config_hash,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -848,9 +67,165 @@ _LABEL_RE = re.compile(
 
 _LABEL_OCR_FIX = str.maketrans({"l": "1", "I": "1", "O": "0"})
 
+# Dash-numbered definition labels: "(2-1)", "(2-30)". Unlike _PAREN_LABEL_RE /
+# _PAREN_DOTTED_LABEL_RE (which require the label to be the box's ENTIRE text), these
+# usually share a line with the equation, so they are scanned with finditer + the same
+# cross-reference rejection as _LABEL_RE matches.
+_DASH_LABEL_RE = re.compile(r"\(\s*((?:\d|[lI]){1,3}\s*-\s*(?:\d|[lI]){1,3})\s*\)")
+
+# Dotted parenthesized labels that share a line with the equation: "y = mx  (5.2)".
+# Anchored at end-of-line because "(5.2)" also occurs mid-sentence as a cross-reference
+# and as a plain numeric value; matches are additionally non-explicit (they require
+# aligned formula geometry downstream) and reject a digit/dot immediately before the
+# paren (decimal values like "0.5(2.3)").
+_PAREN_EOL_LABEL_RE = re.compile(
+    # First component [1-9]…: chapter numbers never start with 0, whereas parenthesized
+    # decimal VALUES ("(0.164)" in tables) do.
+    r"\(\s*([1-9](?:\d|[lI]){0,2}\.(?:\d|[lI]){1,3})\s*\)[ \t]*$",
+    re.MULTILINE,
+)
+
+# Bracketed dotted labels at end-of-line: "y = mx  [1.1]". Same trust model and guards as
+# _PAREN_EOL_LABEL_RE (non-explicit; document arbitration + formula geometry). The dotted
+# form is REQUIRED so citation brackets "[12]" never match.
+_BRACKET_EOL_LABEL_RE = re.compile(
+    r"\[\s*([1-9](?:\d|[lI]){0,2}\.(?:\d|[lI]){1,3})\s*\][ \t]*$", re.MULTILINE
+)
+
+# Whole-box bracketed dotted label: box text is exactly "[1.1]".
+_BRACKET_BOX_LABEL_RE = re.compile(
+    r"^\s*\[\s*([1-9]\d{0,2}(?:\.\d{1,3}){1,3})\s*\]\s*$",
+)
+
+# Whole-box BARE dotted number: box text is exactly "1.6" (a standalone right-margin label).
+# Inline bare numbers are un-disambiguable from values ("= 1.6"), so only the whole-box form
+# is ever considered, and it still needs formula-geometry corroboration + arbitration.
+_BARE_BOX_LABEL_RE = re.compile(
+    r"^\s*([1-9]\d{0,2}(?:\.\d{1,3}){1,3})\s*$",
+)
+
+
+def _iter_label_matches(text: str):
+    """Yield ``(match, explicit)`` for definition-label conventions found in ``text``.
+
+    ``explicit`` matches (Eq. X.X.X, dash labels) are trusted on their own; non-explicit
+    ones (end-of-line "(5.2)") must be corroborated by aligned formula geometry because
+    the same token also appears as cross-references and numeric values.
+    """
+    for m in _LABEL_RE.finditer(text):
+        yield m, True
+    for m in _DASH_LABEL_RE.finditer(text):
+        yield m, True
+    for eol_re in (_PAREN_EOL_LABEL_RE, _BRACKET_EOL_LABEL_RE):
+        for m in eol_re.finditer(text):
+            prev = text[m.start() - 1] if m.start() > 0 else ""
+            if prev.isdigit() or prev == ".":
+                continue
+            yield m, False
+
+
+def _allowed_nonexplicit_labels(
+    candidates: list[tuple[str, bool]],
+) -> set[str]:
+    """Document-level arbitration for non-explicit ("(5.2)" end-of-line) label candidates.
+
+    Explicit conventions (Eq. X.X.X, dash) are unambiguous; "(5.2)" also matches numeric
+    values, so it is only trusted when it IS the book's convention: when explicit labels
+    clearly dominate (>=3 of them and at least as many as the paren candidates), every
+    non-explicit candidate is a value/cross-ref and is dropped. Dominance, not an absolute
+    count — books using the paren convention still mention "Eq. 4.22" in prose a few times.
+    Otherwise a non-explicit label is kept only when its leading component (chapter prefix)
+    repeats — one-off hits like "(0.132)" or "(94.39)" do not.
+    """
+    explicit_labels = {lbl for lbl, exp in candidates if exp}
+    nonexplicit = {lbl for lbl, exp in candidates if not exp}
+    if len(explicit_labels) >= 3 and len(explicit_labels) >= len(nonexplicit):
+        return set()
+    prefix_counts: dict[str, int] = {}
+    for lbl in nonexplicit:
+        prefix = re.split(r"[.\-]", lbl)[0]
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+    return {lbl for lbl in nonexplicit if prefix_counts[re.split(r"[.\-]", lbl)[0]] >= 2}
+
 
 def _normalise_label(raw: str) -> str:
     return re.sub(r"\s+", "", raw).translate(_LABEL_OCR_FIX)
+
+
+# Standalone connective/prose words that occasionally precede a displayed equation on the same
+# typeset line (e.g. "or  P_u = f_u A_u"). When such a word is the leading token of a formula
+# fragment its glyphs are trimmed from the crop's left edge so the crop is the equation alone.
+# Kept deliberately short and lowercase; a leading single variable (P, f, x) is never in this set.
+_LEADING_PROSE = frozenset(
+    {"or", "and", "where", "for", "thus", "hence", "so", "then", "with", "if", "when", "use"}
+)
+
+
+def _iter_text_lines(box: LTTextBox) -> list[LTTextLine]:
+    """Return the LTTextLine children of a text box (empty if not iterable)."""
+    try:
+        return [ln for ln in box if isinstance(ln, LTTextLine)]
+    except TypeError:  # pragma: no cover - defensive; LTTextBox is iterable
+        return []
+
+
+def _label_anchor_bbox(box: LTTextBox, label_str: str) -> tuple[float, float, float, float]:
+    """Return the tightest bbox anchoring ``label_str`` within ``box``.
+
+    Pdfminer sometimes merges a right-margin label ("Eq. 12.4.8") with the adjacent prose
+    paragraph into a single wide text box, so the box's own ``bbox`` left edge is the paragraph
+    left, not the label. Anchoring on the specific text LINE that carries the label restores the
+    correct label geometry (used for the formula search and crop-tightening anchor). Falls back
+    to the full box bbox when no line carries the label (the common single-line-label case is
+    identical either way).
+    """
+    for line in _iter_text_lines(box):
+        for m, _explicit in _iter_label_matches(line.get_text()):
+            if _normalise_label(m.group(1)) == label_str:
+                return line.bbox
+    return box.bbox
+
+
+class _BBoxAnchor:
+    """Lightweight ``.bbox``-bearing stand-in so bbox helpers can take a tightened label bbox."""
+
+    __slots__ = ("bbox",)
+
+    def __init__(self, bbox: tuple[float, float, float, float]) -> None:
+        self.bbox = bbox
+
+
+def _leading_prose_x0(box: LTTextBox) -> float | None:
+    """Return the x0 of the first glyph after a leading prose word, or ``None``.
+
+    Scans the leftmost text line: if its first whitespace-delimited token is a standalone prose
+    word (see ``_LEADING_PROSE``), the equation actually starts at the next glyph, so the label
+    crop should begin there rather than at the prose. Returns ``None`` when there is no such
+    leading prose (the overwhelmingly common case), leaving the left edge untouched.
+    """
+    lines = _iter_text_lines(box)
+    if not lines:
+        return None
+    line = min(lines, key=lambda ln: ln.bbox[0])
+
+    token = ""
+    token_done = False
+    for obj in line:
+        text = obj.get_text()
+        if not token_done:
+            if text.strip() == "":
+                if token:
+                    token_done = True
+                continue
+            token += text
+        else:
+            if text.strip() == "":
+                continue
+            if isinstance(obj, LTChar):
+                if token.lower() in _LEADING_PROSE:
+                    return float(obj.x0)
+                return None
+    return None
 
 
 def _formula_bbox_for_label(
@@ -887,7 +262,13 @@ def _formula_bbox_for_label(
 
     if not aligned:
         return None
-    x0 = min(box.bbox[0] for box in aligned)
+    # Left edge, trimming any leading prose token ("or", "where", …) that shares a fragment's
+    # line so the crop starts at the equation rather than the connective word.
+    left_edges: list[float] = []
+    for box in aligned:
+        trimmed = _leading_prose_x0(box)
+        left_edges.append(trimmed if trimmed is not None else box.bbox[0])
+    x0 = min(left_edges)
     raw_y0 = min(box.bbox[1] for box in aligned)
     raw_y1 = max(box.bbox[3] for box in aligned)
     capped_y0 = max(raw_y0, label_cy - label_height * 3.0)
@@ -927,7 +308,9 @@ _PAREN_LABEL_RE = re.compile(
 
 # Parenthesized multi-part dotted label: "(5.5.11)", "(3.9.1)"
 _PAREN_DOTTED_LABEL_RE = re.compile(
-    r"^\s*\(\s*(\d{1,3}(?:\.\d{1,3}){1,3})\s*\)\s*$",
+    # First component [1-9]…: rejects whole-box parenthesized decimal values such as
+    # "(0.164)" in tables (28120_09a), which are never equation labels.
+    r"^\s*\(\s*([1-9]\d{0,2}(?:\.\d{1,3}){1,3})\s*\)\s*$",
 )
 
 # Common English prose words — ≥2 hits means the label is a cross-reference
@@ -942,6 +325,92 @@ _PROSE_WORDS_RE = re.compile(
 )
 
 
+def _crop_ink_bands(crop: Image.Image) -> tuple[list[tuple[int, int]], int, int]:
+    """Return (bands, height, width) where bands are (y0,y1) runs of ink rows.
+
+    An "ink row" is a row whose dark-pixel count exceeds a small fraction of the width, so
+    isolated specks do not create spurious bands.
+    """
+    gray = np.asarray(crop.convert("L"))
+    h, w = gray.shape
+    ink = gray < 200
+    row_has_ink = ink.sum(axis=1) > max(2, int(0.01 * w))
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for y in range(h):
+        if row_has_ink[y] and start is None:
+            start = y
+        elif not row_has_ink[y] and start is not None:
+            bands.append((start, y - 1))
+            start = None
+    if start is not None:
+        bands.append((start, h - 1))
+    return bands, h, w
+
+
+def _tighten_crop(
+    crop: Image.Image,
+    anchor_row: int | None = None,
+    gap_px: float | None = None,
+) -> Image.Image:
+    """Trim prose lines that bled into a label-anchored equation crop.
+
+    Using a horizontal ink projection, keep the content band that the equation occupies —
+    identified by ``anchor_row`` (the label's vertical position within the crop, since the
+    label sits on the equation's baseline) — plus neighbouring bands separated by only a
+    small gap (fraction numerator/denominator, aligned multi-line systems). Bands separated
+    by a gap larger than a text-line height (a prose paragraph) are dropped.
+
+    ``anchor_row`` is essential: the equation is NOT always vertically centred (prose bleed
+    can push it to an edge), so anchoring on the crop centre would keep the wrong band.
+    Falls back to the centre only when no anchor is supplied.
+
+    Conservative by design: only leading/trailing bands are removed, never interior ones,
+    and if nothing would be trimmed the original crop is returned unchanged. Falls back to
+    the untouched crop when numpy is unavailable.
+    """
+    if np is None:
+        return crop
+    bands, h, w = _crop_ink_bands(crop)
+    if len(bands) <= 1 or h < 20 or w < 20:
+        return crop
+
+    # A prose separation is a gap comparable to a text-line height, whereas gaps *within* an
+    # equation (fraction numerator/bar/denominator, sub/superscripts) are smaller. The label
+    # height is the stable reference for a text line, so derive the threshold from it when
+    # available. The old min-band-height heuristic split fractions (tiny sub/superscript
+    # bands made the threshold too small), so it is only a fallback.
+    if gap_px is not None:
+        gap_threshold = max(10, int(gap_px))
+    else:
+        heights = [b1 - b0 + 1 for b0, b1 in bands]
+        gap_threshold = max(8, int(0.8 * min(heights)))
+
+    ref = anchor_row if anchor_row is not None else h // 2
+    ref = max(0, min(h - 1, ref))
+    anchor = min(
+        range(len(bands)),
+        key=lambda i: (
+            0
+            if bands[i][0] <= ref <= bands[i][1]
+            else min(abs(bands[i][0] - ref), abs(bands[i][1] - ref))
+        ),
+    )
+
+    lo = hi = anchor
+    while lo - 1 >= 0 and (bands[lo][0] - bands[lo - 1][1] - 1) <= gap_threshold:
+        lo -= 1
+    while hi + 1 < len(bands) and (bands[hi + 1][0] - bands[hi][1] - 1) <= gap_threshold:
+        hi += 1
+
+    top, bot = bands[lo][0], bands[hi][1]
+    if top == 0 and bot == h - 1:
+        return crop  # nothing to trim
+
+    pad = 4
+    return crop.crop((0, max(0, top - pad), w, min(h, bot + pad + 1)))
+
+
 def _save_crop(
     page_image: Image.Image,
     bbox_points: tuple[float, float, float, float],
@@ -949,8 +418,17 @@ def _save_crop(
     dpi: int,
     eq_id: str,
     crops_dir: Path,
+    *,
+    label_y_pts: float | None = None,
+    label_height_pts: float | None = None,
 ) -> str:
     """Crop the equation region from the page image and save as PNG.
+
+    When tightening is enabled the vertical window is first *expanded* by
+    ``CROP_VEXPAND_FACTOR`` label-heights on each side so equations the label-anchored bbox
+    under-captured (clipped numerators/denominators) are fully included; ``_tighten_crop``
+    then trims the prose/whitespace the expansion pulls in, anchored on the label row
+    (``label_y_pts``) so it keeps the equation band even when it is not vertically centred.
 
     Returns the path relative to the book output directory.
     """
@@ -958,16 +436,35 @@ def _save_crop(
     scale = dpi / config.PDF_POINTS_PER_INCH
     pad = config.CROP_PADDING_PX
 
+    # Generous vertical expansion, paired with tightening (never expand without trimming),
+    # so equations the bbox under-captured vertically are fully included and the excess is
+    # trimmed. (Horizontal expansion was evaluated and rejected — it regressed neighbouring
+    # crops without recovering the hard left-clip cases.)
+    expand = 0
+    if config.CROP_TIGHTEN_ENABLED and label_height_pts:
+        expand = int(config.CROP_VEXPAND_FACTOR * label_height_pts * scale)
+
     px0 = max(0, int(x0 * scale) - pad)
-    py0 = max(0, int(y0 * scale) - pad)
-    px1 = min(page_image.width,  int(x1 * scale) + pad)
-    py1 = min(page_image.height, int(y1 * scale) + pad)
+    py0 = max(0, int(y0 * scale) - pad - expand)
+    px1 = min(page_image.width, int(x1 * scale) + pad)
+    py1 = min(page_image.height, int(y1 * scale) + pad + expand)
 
     if px1 <= px0 or py1 <= py0:
         logger.warning("invalid_crop eq_id=%s bbox=%s", eq_id, bbox_points)
         return ""
 
     crop = page_image.crop((px0, py0, px1, py1))
+    if config.CROP_TIGHTEN_ENABLED:
+        try:
+            anchor_row = int(label_y_pts * scale) - py0 if label_y_pts is not None else None
+            gap_px = (
+                config.CROP_TIGHTEN_GAP_FACTOR * label_height_pts * scale
+                if label_height_pts
+                else None
+            )
+            crop = _tighten_crop(crop, anchor_row, gap_px)
+        except Exception as exc:  # pragma: no cover - never fail a run over tightening
+            logger.debug("crop_tighten_failed eq_id=%s error=%s", eq_id, exc)
     page_dir = crops_dir / f"page_{page_number:03d}"
     page_dir.mkdir(parents=True, exist_ok=True)
     dest = page_dir / f"{eq_id}.png"
@@ -979,9 +476,7 @@ def _save_crop(
 def _extract_page_layout(pdf_path: Path) -> list[tuple[int, list[LTTextBox]]]:
     """Return (0-based page index, list of LTTextBox) for all pages."""
     rsrcmgr = PDFResourceManager()
-    laparams = LAParams(
-        line_overlap=0.5, char_margin=2.0, line_margin=0.5, word_margin=0.1
-    )
+    laparams = LAParams(line_overlap=0.5, char_margin=2.0, line_margin=0.5, word_margin=0.1)
     device = PDFPageAggregator(rsrcmgr, laparams=laparams)
     interpreter = PDFPageInterpreter(rsrcmgr, device)
 
@@ -994,9 +489,7 @@ def _extract_page_layout(pdf_path: Path) -> list[tuple[int, list[LTTextBox]]]:
                 boxes = [el for el in layout if isinstance(el, LTTextBox)]
                 results.append((page_idx, boxes))
             except Exception as exc:
-                logger.debug(
-                    "layout_extract_failed page=%d error=%s", page_idx, exc
-                )
+                logger.debug("layout_extract_failed page=%d error=%s", page_idx, exc)
                 results.append((page_idx, []))
     return results
 
@@ -1010,33 +503,52 @@ def scan_equation_labels(pdf_path: Path) -> list[str]:
     """
     labels: list[str] = []
     seen: set[str] = set()
+    # Two-phase: collect candidates per page first, then arbitrate paren-EOL labels
+    # document-wide (they collide with numeric values, so they are only trusted when the
+    # book's convention — see _allowed_nonexplicit_labels).
+    pages_data: list[tuple[list[tuple[str, LTTextBox, str]], list[LTTextBox]]] = []
+    arbitration_pool: list[tuple[str, bool]] = []
     for _page_idx, boxes in _extract_page_layout(Path(pdf_path)):
         formula_boxes: list[LTTextBox] = []
-        candidates: list[tuple[str, LTTextBox, bool]] = []
+        candidates: list[tuple[str, LTTextBox, str]] = []
         for box in boxes:
             text = box.get_text().strip()
             found_any = False
-            for m in _LABEL_RE.finditer(text):
+            for m, explicit in _iter_label_matches(text):
                 found_any = True
                 if not _is_cross_reference_for_match(text, m):
-                    candidates.append((_normalise_label(m.group(1)), box, True))
+                    label = _normalise_label(m.group(1))
+                    candidates.append((label, box, "explicit" if explicit else "paren_eol"))
+                    arbitration_pool.append((label, explicit))
             if found_any:
                 if not any(c[1] is box for c in candidates):
                     formula_boxes.append(box)
                 continue
-            dpm = _PAREN_DOTTED_LABEL_RE.match(text)
+            dpm = _PAREN_DOTTED_LABEL_RE.match(text) or _BRACKET_BOX_LABEL_RE.match(text)
             if dpm:
-                candidates.append((dpm.group(1), box, True))
+                # Whole-box "(4.12)" / "[1.1]" is trusted for itself but counts as paren-
+                # convention evidence (False) — it must not suppress its own inline matches.
+                candidates.append((dpm.group(1), box, "box_dotted"))
+                arbitration_pool.append((dpm.group(1), False))
                 continue
             paren = _PAREN_LABEL_RE.match(text)
+            bare = _BARE_BOX_LABEL_RE.match(text) if config.BARE_NUMBER_LABELS_ENABLED else None
             if paren:
-                candidates.append((paren.group(1), box, False))
+                candidates.append((paren.group(1), box, "box_paren"))
+            elif bare:
+                candidates.append((bare.group(1), box, "box_bare"))
+                arbitration_pool.append((bare.group(1), False))
             else:
                 formula_boxes.append(box)
+        pages_data.append((candidates, formula_boxes))
 
-        for label, label_box, explicit_eq_label in candidates:
+    allowed_eol = _allowed_nonexplicit_labels(arbitration_pool)
+    for candidates, formula_boxes in pages_data:
+        for label, label_box, origin in candidates:
+            if origin in ("paren_eol", "box_bare") and label not in allowed_eol:
+                continue
             if (
-                not explicit_eq_label
+                origin in ("paren_eol", "box_paren", "box_bare")
                 and _formula_bbox_for_label(label_box, formula_boxes) is None
             ):
                 continue
@@ -1046,6 +558,44 @@ def scan_equation_labels(pdf_path: Path) -> list[str]:
     return labels
 
 
+# A running-sentence continuation immediately after a label: a lowercase alphabetic word of
+# length >=2 (e.g. "become", "becomes", "thus"). A genuine right-margin label is line-terminal
+# (nothing meaningful follows it on the line), whereas a spelled-out prose cross-reference such
+# as "equation 1.29 become" continues into a verb. Length >=2 and all-lowercase deliberately
+# excludes trailing math (a single variable "x", or mixed-case tokens like "dV").
+_RUNNING_SENTENCE_AFTER_RE = re.compile(r"^[a-z]{2,}\b")
+
+# Sentence-initial words that INTRODUCE a reference to an existing equation ("From Eq. 3.9.1(a):",
+# "Substituting equation 1.27 …"). When the line begins with one of these before the label, the
+# label is a cross-reference, not an anchor. Deliberately excludes math connectives that legitimately
+# precede a displayed equation on its own line ("where", "for", "or", "and", "thus"), which is why
+# a curated introducer set is used rather than the broad _PROSE_WORDS_RE.
+_REF_INTRO_WORDS = frozenset(
+    {
+        "from",
+        "see",
+        "using",
+        "use",
+        "substituting",
+        "substitute",
+        "recall",
+        "combining",
+        "comparing",
+        "applying",
+        "apply",
+        "consider",
+        "putting",
+        "equating",
+        "integrating",
+        "differentiating",
+        "solving",
+        "dividing",
+        "multiplying",
+        "rearranging",
+    }
+)
+
+
 def _is_cross_reference_for_match(text: str, m: re.Match) -> bool:
     """True when this specific label match is embedded in prose (cross-reference).
 
@@ -1053,6 +603,12 @@ def _is_cross_reference_for_match(text: str, m: re.Match) -> bool:
     rather than 1 so that mathematical qualifiers like "for", "or", "in" do
     not mis-classify equation definitions such as "f(x) = 1  for  x > 0
     Eq. 5.5.11".
+
+    Additionally treats the label as a cross-reference when the line continues into a
+    running sentence right after it (a lowercase verb continuation such as "…1.29 become"
+    or "…1.65 thus becomes"). Image-based math books spell out "equation N.N" mid-sentence,
+    which _LABEL_RE matches; those references are line-internal, not line-terminal margin
+    labels, so this rule keeps them out of the label universe.
     """
     label_start, label_end = m.start(), m.end()
 
@@ -1067,6 +623,11 @@ def _is_cross_reference_for_match(text: str, m: re.Match) -> bool:
     if before_on_line and len(_PROSE_WORDS_RE.findall(before_on_line)) >= 2:
         return True
     if after_on_line and len(_PROSE_WORDS_RE.findall(after_on_line)) >= 2:
+        return True
+    if after_on_line and _RUNNING_SENTENCE_AFTER_RE.match(after_on_line):
+        return True
+    first_before = re.match(r"[A-Za-z]+", before_on_line)
+    if first_before and first_before.group(0).lower() in _REF_INTRO_WORDS:
         return True
     return False
 
@@ -1108,7 +669,12 @@ def _find_labeled_equations(
             text = box.get_text().strip()
             found_any = False
             all_cross_refs = True
-            for m in _LABEL_RE.finditer(text):
+            for m, explicit in _iter_label_matches(text):
+                # Legacy path is single-pass per page and cannot arbitrate paren-EOL
+                # labels document-wide, so it accepts explicit conventions only; the
+                # hybrid path handles "(5.2)"-convention books.
+                if not explicit:
+                    continue
                 found_any = True
                 if not _is_cross_reference_for_match(text, m):
                     all_cross_refs = False
@@ -1130,42 +696,61 @@ def _find_labeled_equations(
 
         for label_str, label_box, explicit_eq_label in label_boxes:
             if label_str in seen_labels:
-                logger.debug(
-                    "label_duplicate_skipped label=%s page=%d", label_str, page_number
-                )
+                logger.debug("label_duplicate_skipped label=%s page=%d", label_str, page_number)
                 continue
-            lx0, ly0, lx1, ly1 = label_box.bbox
+            # Anchor on the label's own text line, not the whole box: pdfminer sometimes merges
+            # a right-margin label with its adjacent prose paragraph, which would otherwise put
+            # the label's left edge at the paragraph and send the crop to the wrong region.
+            anchor = _BBoxAnchor(_label_anchor_bbox(label_box, label_str))
+            lx0, ly0, lx1, ly1 = anchor.bbox
 
-            formula_bbox = _formula_bbox_for_label(label_box, formula_boxes)
+            formula_bbox = _formula_bbox_for_label(anchor, formula_boxes)
             if formula_bbox is not None:
                 fx0, fy0, fx1, fy1 = formula_bbox
             elif not explicit_eq_label:
                 logger.debug(
                     "parenthesized_list_marker_skipped label=%s page=%d",
-                    label_str, page_number,
+                    label_str,
+                    page_number,
                 )
                 continue
             else:
-                fx0, fy0, fx1, fy1 = _image_formula_bbox_for_label(label_box)
+                fx0, fy0, fx1, fy1 = _image_formula_bbox_for_label(anchor)
 
             seen_labels.add(label_str)
 
             page_height_pts = rp.height_px / (rp.dpi / config.PDF_POINTS_PER_INCH)
             bbox = (fx0, page_height_pts - fy1, fx1, page_height_pts - fy0)
 
+            # Label geometry (top-left points) for expansion + tightening anchor: the label
+            # sits on the equation's baseline, so its row identifies the equation band.
+            label_y_pts = page_height_pts - (ly0 + ly1) / 2.0
+            label_height_pts = max(ly1 - ly0, 8.0)
+
             safe_label = re.sub(r"[^A-Za-z0-9]+", "_", label_str).strip("_")
             eq_id = f"eq_{eq_counter}_p{page_number}_{safe_label}"
             eq_counter += 1
 
-            crop_rel = _save_crop(rp.image, bbox, page_number, rp.dpi, eq_id, crops_dir)
-            regions.append(EquationRegion(
-                page_number=page_number,
-                equation_id=eq_id,
-                label=label_str,
-                bbox=bbox,
-                detection_method="label",
-                crop_path=crop_rel or None,
-            ))
+            crop_rel = _save_crop(
+                rp.load_image(),
+                bbox,
+                page_number,
+                rp.dpi,
+                eq_id,
+                crops_dir,
+                label_y_pts=label_y_pts,
+                label_height_pts=label_height_pts,
+            )
+            regions.append(
+                EquationRegion(
+                    page_number=page_number,
+                    equation_id=eq_id,
+                    label=label_str,
+                    bbox=bbox,
+                    detection_method="label",
+                    crop_path=crop_rel or None,
+                )
+            )
 
     return regions
 
@@ -1226,28 +811,592 @@ def _find_ml_equations(
             if rp is None:
                 continue
 
+            # Docling bboxes are bottom-left origin; _save_crop expects top-left points.
+            page = doc.pages.get(page_number) if hasattr(doc.pages, "get") else None
+            if page is None:
+                continue
+            tl = bbox_obj.to_top_left_origin(float(page.size.height))
             bbox = (
-                float(bbox_obj.l),
-                float(bbox_obj.t),
-                float(bbox_obj.r),
-                float(bbox_obj.b),
+                float(tl.l),
+                float(tl.t),
+                float(tl.r),
+                float(tl.b),
             )
             eq_id = f"eq_{eq_counter}_p{page_number}_ml"
             eq_counter += 1
 
-            crop_rel = _save_crop(rp.image, bbox, page_number, rp.dpi, eq_id, crops_dir)
-            regions.append(EquationRegion(
-                page_number=page_number,
-                equation_id=eq_id,
-                label=None,
-                bbox=bbox,
-                detection_method="ml",
-                crop_path=crop_rel or None,
-            ))
+            crop_rel = _save_crop(rp.load_image(), bbox, page_number, rp.dpi, eq_id, crops_dir)
+            regions.append(
+                EquationRegion(
+                    page_number=page_number,
+                    equation_id=eq_id,
+                    label=None,
+                    bbox=bbox,
+                    detection_method="ml",
+                    crop_path=crop_rel or None,
+                )
+            )
     except Exception as exc:
         logger.error("ml_detection_failed error=%s", exc)
 
     return regions
+
+
+def _detect_docling_regions(
+    pdf_path: Path, pages: list[RenderedPage]
+) -> dict[int, list[tuple[float, float, float, float]]]:
+    """Run Docling layout detection and return formula bboxes per page (top-left points).
+
+    Detection ONLY — ``do_formula_enrichment`` stays off so the CPU-bound CodeFormulaV2 LaTeX
+    decode never runs (it is 20–40 min/chapter on CPU; recognition stays on the VL/judge path).
+    Returns ``{page_no(1-based): [(l, t, r, b), …]}`` with coordinates in PDF points, top-left
+    origin — the same space ``_save_crop``/``EquationRegion.bbox`` use.
+    """
+    try:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+    except ImportError:
+        logger.warning("docling not installed; hybrid detection unavailable")
+        return {}
+
+    out: dict[int, list[tuple[float, float, float, float]]] = {}
+    try:
+        raw_artifacts = os.getenv("DOCLING_ARTIFACTS_PATH", "").strip()
+        if raw_artifacts and not Path(raw_artifacts).is_dir():
+            logger.warning("docling_artifacts_path_missing path=%s; using HF cache", raw_artifacts)
+            raw_artifacts = ""
+        pipeline_options = PdfPipelineOptions(
+            do_ocr=False,
+            do_table_structure=False,
+            do_formula_enrichment=False,
+            artifacts_path=raw_artifacts or None,
+        )
+        converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+        )
+        doc = converter.convert(str(pdf_path)).document
+        for item, _ in doc.iterate_items():
+            if str(getattr(item, "label", "")).lower() not in {"formula", "equation"}:
+                continue
+            prov = getattr(item, "prov", []) or []
+            if not prov:
+                continue
+            page_no = getattr(prov[0], "page_no", 0)
+            bbox_obj = getattr(prov[0], "bbox", None)
+            page = doc.pages.get(page_no) if hasattr(doc.pages, "get") else None
+            if bbox_obj is None or page_no == 0 or page is None:
+                continue
+            ph = float(page.size.height)
+            tl = bbox_obj.to_top_left_origin(ph)
+            out.setdefault(page_no, []).append((float(tl.l), float(tl.t), float(tl.r), float(tl.b)))
+    except Exception as exc:
+        logger.error("docling_detect_failed error=%s", exc)
+    return out
+
+
+def _associate_labels_to_regions(
+    labels: list[tuple[str, tuple[float, float, float, float]]],
+    regions: list[tuple[float, float, float, float]],
+) -> dict[str, tuple[float, float, float, float]]:
+    """Map each label to its Docling crop box (top-left points); labels with none are absent.
+
+    Docling frequently emits a labeled equation as SEVERAL fragments (LHS, numerator, bar,
+    denominator) or a single thin baseline strip. Picking one region by nearest edge clips the
+    equation (measured: 22/56 crops came out ~6pt tall). So instead, for each label we take the
+    UNION of every fragment on its row, which reassembles the whole equation; a tall region
+    shared by stacked labels is split vertically first so each label keeps only its band. A
+    minimum height derived from the label height guards the remaining thin single-line cases.
+    """
+    label_info: dict[str, tuple[float, float, float, float]] = {}  # label -> (lx0, cy, h, w)
+    reg_labels: dict[int, list[str]] = {i: [] for i in range(len(regions))}
+    for label, (lx0, lt, lx1, lb) in labels:
+        cy = (lt + lb) / 2.0
+        h = max(lb - lt, 8.0)
+        label_info[label] = (lx0, cy, h, max(lx1 - lx0, 0.0))
+        for i, (rl, rt, rr, rb) in enumerate(regions):
+            if rl >= lx0 + h:  # region must start left of the margin label
+                continue
+            if rt - 1.5 * h <= cy <= rb + 1.5 * h:  # region row overlaps the label baseline
+                reg_labels[i].append(label)
+
+    # Each region contributes to the label(s) whose row it overlaps; a region shared by several
+    # stacked labels is split vertically (midpoints between adjacent label rows).
+    parts: dict[str, list[tuple[float, float, float, float]]] = {lbl: [] for lbl, _ in labels}
+    for i, (rl, rt, rr, rb) in enumerate(regions):
+        labs = reg_labels[i]
+        if not labs:
+            continue
+        if len(labs) == 1:
+            parts[labs[0]].append((rl, rt, rr, rb))
+            continue
+        labs.sort(key=lambda L: label_info[L][1])
+        cys = [label_info[L][1] for L in labs]
+        for j, L in enumerate(labs):
+            bt = rt if j == 0 else (cys[j - 1] + cys[j]) / 2.0
+            bb = rb if j == len(labs) - 1 else (cys[j] + cys[j + 1]) / 2.0
+            parts[L].append((rl, bt, rr, bb))
+
+    out: dict[str, tuple[float, float, float, float]] = {}
+    for label, (lx0, cy, h, lw) in label_info.items():
+        ps = parts[label]
+        if not ps:
+            continue
+        x0 = min(p[0] for p in ps)
+        x1 = max(p[2] for p in ps)
+        y0 = min(p[1] for p in ps)
+        y1 = max(p[3] for p in ps)
+        # Label-only association: the union never extends left of the label's own left edge,
+        # i.e. Docling only detected the printed label text (typical when the equation itself
+        # is an image with no separate formula region). Cropping it would ship a picture of
+        # "Eq. 5.5.1" — discard so the reconstruction fallback supplies a real crop instead.
+        # Only meaningful for a NARROW standalone-label anchor: when the label is embedded in
+        # a prose line the anchor spans the whole line, its left edge is the line start, and
+        # this test would wrongly discard a legitimate association (measured: 39896_02 2-2).
+        if lw <= 6.0 * h and x0 >= lx0 - 2.0 * h:
+            continue
+        # Floor so thin/partial detections keep vertical context: fractions/integral limits
+        # need ~2 label-heights (1.6 measured too small on degraded scans — 39896_02 2-27).
+        min_h = 2.0 * h
+        if (y1 - y0) < min_h:
+            y0 = min(y0, cy - min_h / 2.0)
+            y1 = max(y1, cy + min_h / 2.0)
+        out[label] = (x0, y0, x1, y1)
+    return out
+
+
+def _save_crop_simple(
+    page_image: Image.Image,
+    bbox_points: tuple[float, float, float, float],
+    page_number: int,
+    dpi: int,
+    eq_id: str,
+    crops_dir: Path,
+) -> str:
+    """Crop a model-detected region: fixed fractional pad, NO ink-projection tightening.
+
+    A detector bbox is already tight and prose-free, so the vertical-expansion / band-trimming
+    heuristics (`_tighten_crop`, `CROP_VEXPAND_FACTOR`) are unnecessary and off by construction.
+    """
+    x0, y0, x1, y1 = bbox_points
+    x0, x1 = min(x0, x1), max(x0, x1)  # normalise ordering defensively
+    y0, y1 = min(y0, y1), max(y0, y1)
+    scale = dpi / config.PDF_POINTS_PER_INCH
+    px0, py0, px1, py1 = x0 * scale, y0 * scale, x1 * scale, y1 * scale
+    pf = config.CROP_PAD_FRAC
+    # Vertical pad floor recovers clipped integral limits / fraction denominators on thin
+    # detector strips; horizontal stays small — sideways clips are detection gaps, and a wide
+    # x-pad risks bleeding the neighbouring column in two-column layouts.
+    dx = max((px1 - px0) * pf, 2.0 * scale)
+    dy = max((py1 - py0) * pf, config.CROP_MIN_PAD_PTS * scale)
+    cx0, cy0 = max(0, int(px0 - dx)), max(0, int(py0 - dy))
+    cx1 = min(page_image.width, int(px1 + dx))
+    cy1 = min(page_image.height, int(py1 + dy))
+    if cx1 <= cx0 or cy1 <= cy0:
+        logger.warning("invalid_crop eq_id=%s bbox=%s", eq_id, bbox_points)
+        return ""
+    page_dir = crops_dir / f"page_{page_number:03d}"
+    page_dir.mkdir(parents=True, exist_ok=True)
+    page_image.crop((cx0, cy0, cx1, cy1)).save(page_dir / f"{eq_id}.png", format="PNG")
+    return str(Path("crops") / f"page_{page_number:03d}" / f"{eq_id}.png")
+
+
+def _find_hybrid_equations(
+    pdf_path: Path,
+    pages: list[RenderedPage],
+    crops_dir: Path,
+    docling_by_page: dict[int, list[tuple[float, float, float, float]]],
+) -> list[EquationRegion]:
+    """Detect labeled equations, cropping from the Docling box when available.
+
+    Scoping/numbering come from the proven label scan (document-wide dedup via ``seen_labels``);
+    the crop geometry comes from Docling (tight, no tuning) when a region associates with the
+    label, else falls back to the legacy reconstruction bbox + ``_save_crop`` for the rare miss.
+    """
+    page_map = {rp.page_number: rp for rp in pages}
+    page_layouts = _extract_page_layout(pdf_path)
+    seen_labels: set[str] = set()
+    arbitration_pool: list[tuple[str, bool]] = []
+
+    # Pass 1 — gather deduped label anchors + formula boxes (for reconstruction fallback) per page.
+    per_page: dict[int, dict[str, Any]] = {}
+    for page_idx, boxes in page_layouts:
+        page_number = page_idx + 1
+        rp = page_map.get(page_number)
+        if rp is None:
+            continue
+        ph = rp.height_px / (rp.dpi / config.PDF_POINTS_PER_INCH)
+
+        label_boxes: list[tuple[str, LTTextBox, str]] = []
+        formula_boxes: list[LTTextBox] = []
+        for box in boxes:
+            text = box.get_text().strip()
+            found_any = False
+            all_cross_refs = True
+            for m, explicit in _iter_label_matches(text):
+                found_any = True
+                if not _is_cross_reference_for_match(text, m):
+                    all_cross_refs = False
+                    label_boxes.append(
+                        (
+                            _normalise_label(m.group(1)),
+                            box,
+                            "explicit" if explicit else "paren_eol",
+                        )
+                    )
+            if found_any:
+                if all_cross_refs:
+                    formula_boxes.append(box)
+                continue
+            dpm = _PAREN_DOTTED_LABEL_RE.match(text) or _BRACKET_BOX_LABEL_RE.match(text)
+            if dpm:
+                # Trusted for itself, but paren-convention evidence for arbitration.
+                label_boxes.append((dpm.group(1), box, "box_dotted"))
+                continue
+            pm = _PAREN_LABEL_RE.match(text)
+            bare = _BARE_BOX_LABEL_RE.match(text) if config.BARE_NUMBER_LABELS_ENABLED else None
+            if pm:
+                label_boxes.append((pm.group(1), box, "box_paren"))
+            elif bare:
+                label_boxes.append((bare.group(1), box, "box_bare"))
+            else:
+                formula_boxes.append(box)
+
+        anchors: list[tuple[str, tuple[float, float, float, float], str, LTTextBox]] = []
+        for label_str, label_box, origin in label_boxes:
+            if label_str in seen_labels:
+                continue
+            seen_labels.add(label_str)
+            arbitration_pool.append((label_str, origin == "explicit"))
+            ax0, ay0, ax1, ay1 = _label_anchor_bbox(label_box, label_str)
+            anchors.append((label_str, (ax0, ph - ay1, ax1, ph - ay0), origin, label_box))
+        per_page[page_number] = {"anchors": anchors, "formula_boxes": formula_boxes, "ph": ph}
+
+    # Arbitrate paren-EOL labels document-wide (they collide with numeric values).
+    allowed_eol = _allowed_nonexplicit_labels(arbitration_pool)
+
+    # Pass 2 — per page: associate labels ↔ Docling regions (share/split), then crop.
+    regions_out: list[EquationRegion] = []
+    eq_counter = 0
+    source_counts = {"docling": 0, "reconstruction": 0}
+    for page_number in sorted(per_page):
+        info = per_page[page_number]
+        rp = page_map[page_number]
+        ph = info["ph"]
+        page_anchors = [
+            a
+            for a in info["anchors"]
+            if a[2] not in ("paren_eol", "box_bare") or a[0] in allowed_eol
+        ]
+        dl = _associate_labels_to_regions(
+            [(lbl, anc) for (lbl, anc, _o, _b) in page_anchors],
+            docling_by_page.get(page_number, []),
+        )
+        for label_str, _anchor_tl, origin, label_box in page_anchors:
+            explicit = origin in ("explicit", "box_dotted")
+            source = "docling"
+            bbox = dl.get(label_str)
+            if bbox is not None and (bbox[3] - bbox[1] < 3.0 or bbox[2] - bbox[0] < 3.0):
+                # Degenerate association band (label row fell outside the region, or a stacked
+                # split collapsed) — treat as a miss so reconstruction supplies a real crop.
+                bbox = None
+            if bbox is None:
+                # Reconstruction fallback (legacy helpers work in bottom-left points).
+                anchor = _BBoxAnchor(_label_anchor_bbox(label_box, label_str))
+                fb = _formula_bbox_for_label(anchor, info["formula_boxes"])
+                if fb is None and explicit:
+                    fb = _image_formula_bbox_for_label(anchor)
+                if fb is None:
+                    logger.debug("hybrid_no_region_or_reconstruction label=%s", label_str)
+                    continue
+                fx0, fy0, fx1, fy1 = fb
+                bbox = (fx0, ph - fy1, fx1, ph - fy0)
+                source = "reconstruction"
+
+            safe_label = re.sub(r"[^A-Za-z0-9]+", "_", label_str).strip("_")
+            eq_id = f"eq_{eq_counter}_p{page_number}_{safe_label}"
+            eq_counter += 1
+            source_counts[source] += 1
+
+            if source == "docling":
+                crop_rel = _save_crop_simple(
+                    rp.load_image(), bbox, page_number, rp.dpi, eq_id, crops_dir
+                )
+            else:
+                lx0, ly0, lx1, ly1 = _label_anchor_bbox(label_box, label_str)
+                crop_rel = _save_crop(
+                    rp.load_image(),
+                    bbox,
+                    page_number,
+                    rp.dpi,
+                    eq_id,
+                    crops_dir,
+                    label_y_pts=ph - (ly0 + ly1) / 2.0,
+                    label_height_pts=max(ly1 - ly0, 8.0),
+                )
+            regions_out.append(
+                EquationRegion(
+                    page_number=page_number,
+                    equation_id=eq_id,
+                    label=label_str,
+                    bbox=bbox,
+                    detection_method="label",
+                    crop_path=crop_rel or None,
+                )
+            )
+    logger.info(
+        "hybrid_crop_sources docling=%d reconstruction=%d",
+        source_counts["docling"],
+        source_counts["reconstruction"],
+    )
+    return regions_out
+
+
+def _merge_row_fragments(
+    boxes: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Union Docling formula fragments that belong to one display equation.
+
+    Docling emits one equation as several boxes (LHS / numerator / bar / continuation line).
+    Two boxes are merged when their vertical bands overlap by >=50% of the smaller band —
+    the same row test the labeled path's association uses. After merging, tiny leftovers
+    (inline-math slivers far smaller than the page's typical display equation) are dropped.
+    """
+    if not boxes:
+        return []
+    merged: list[list[float]] = []
+    for b in sorted(boxes, key=lambda b: (b[1], b[0])):
+        for m in merged:
+            overlap = min(m[3], b[3]) - max(m[1], b[1])
+            smaller = min(m[3] - m[1], b[3] - b[1])
+            if smaller > 0 and overlap / smaller >= 0.5:
+                m[0], m[1] = min(m[0], b[0]), min(m[1], b[1])
+                m[2], m[3] = max(m[2], b[2]), max(m[3], b[3])
+                break
+        else:
+            merged.append(list(b))
+    heights = sorted(m[3] - m[1] for m in merged)
+    med_h = heights[len(heights) // 2]
+    widths = sorted(m[2] - m[0] for m in merged)
+    med_w = widths[len(widths) // 2]
+    kept = [
+        tuple(m)
+        for m in merged
+        if not ((m[3] - m[1]) < 0.6 * med_h and (m[2] - m[0]) < 0.3 * med_w)
+    ]
+    return kept or [tuple(m) for m in merged]
+
+
+def _regions_from_docling(
+    docling_by_page: dict[int, list[tuple[float, float, float, float]]],
+    pages: list[RenderedPage],
+    crops_dir: Path,
+) -> list[EquationRegion]:
+    """Unlabeled-document path: crop merged Docling formula regions (no label scoping)."""
+    page_map = {rp.page_number: rp for rp in pages}
+    regions: list[EquationRegion] = []
+    eq_counter = 0
+    for page_number in sorted(docling_by_page):
+        rp = page_map.get(page_number)
+        if rp is None:
+            continue
+        for bbox in _merge_row_fragments(docling_by_page[page_number]):
+            eq_id = f"eq_{eq_counter}_p{page_number}_ml"
+            eq_counter += 1
+            crop_rel = _save_crop_simple(
+                rp.load_image(), bbox, page_number, rp.dpi, eq_id, crops_dir
+            )
+            regions.append(
+                EquationRegion(
+                    page_number=page_number,
+                    equation_id=eq_id,
+                    label=None,
+                    bbox=bbox,
+                    detection_method="ml",
+                    crop_path=crop_rel or None,
+                )
+            )
+    return regions
+
+
+def _scan_page_media(pdf_path: Path) -> dict[int, tuple[int, str]]:
+    """Return ``{page_no(1-based): (embedded_image_count, page_text)}``.
+
+    Counts LTImage elements (recursing into LTFigure), which is how books that render display
+    equations as rasters expose them — many small images per page — versus text/vector math
+    (few or none). One pdfminer pass; degrades to an empty map on failure.
+    """
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTFigure, LTImage, LTTextContainer
+
+    out: dict[int, tuple[int, str]] = {}
+    try:
+        for page_no, page in enumerate(extract_pages(str(pdf_path)), start=1):
+            n_images = 0
+            texts: list[str] = []
+
+            def _walk(container) -> None:
+                nonlocal n_images
+                for el in container:
+                    if isinstance(el, LTImage):
+                        n_images += 1
+                    elif isinstance(el, LTFigure):
+                        _walk(el)
+                    elif isinstance(el, LTTextContainer):
+                        texts.append(el.get_text())
+
+            _walk(page)
+            out[page_no] = (n_images, "".join(texts))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("scan_page_media_failed error=%s", exc)
+    return out
+
+
+def _flag_image_math(media: dict[int, tuple[int, str]]) -> set[int]:
+    """Return the set of 'image-math' page numbers, or empty if the document is not image-math.
+
+    Discriminator is the per-page embedded-image COUNT: a page whose display equations (and
+    their margin numbers) are rasterised carries many small images, whereas text/vector math
+    carries few or none. The math-symbol text cue is deliberately NOT used per page — on exactly
+    these pages the math lives in the images, so the text layer is pure prose and would fail it.
+
+    Instead a cheap DOCUMENT-level math-presence gate keeps ordinary image-heavy PDFs (photo
+    albums, scanned figures) from tripping the VLM path: the document must mention equations /
+    contain math on several pages. When both hold and image-dense pages are a meaningful share
+    (``IMAGE_MATH_DOC_PAGE_FRACTION``) of the content pages, every image-dense page is flagged.
+    """
+    min_images = int(getattr(config, "IMAGE_MATH_MIN_IMAGES_PER_PAGE", 6))
+    frac_threshold = float(getattr(config, "IMAGE_MATH_DOC_PAGE_FRACTION", 0.30))
+
+    content_pages = [p for p, (n, _t) in media.items() if n > 0]
+    if not content_pages:
+        return set()
+
+    # Document-level math presence: several pages reference equations or carry math symbols.
+    math_pages = sum(
+        1
+        for _p, (_n, text) in media.items()
+        if _EQUATION_REF_RE.search(text) or _MATH_SYMBOL.search(text)
+    )
+    if math_pages < 3:
+        return set()
+
+    image_dense = {p for p, (n, _t) in media.items() if n >= min_images}
+    if len(image_dense) / len(content_pages) < frac_threshold:
+        return set()
+    return image_dense
+
+
+# "equation 12" / "Eqn. 3" style math cues in page text (used only as an image-math signal,
+# NOT as a label — label matching stays with _LABEL_RE and its cross-reference guards).
+_EQUATION_REF_RE = re.compile(r"\bEq(?:uation|n)?s?\.?\s*\d", re.IGNORECASE)
+
+
+def _vertical_overlap_pts(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> float:
+    """Fraction of the shorter box's height that overlaps vertically (top-left points)."""
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    shorter = min(a[3] - a[1], b[3] - b[1])
+    return overlap / shorter if shorter > 0 else 0.0
+
+
+def _recover_image_math_pages(
+    pages: list[RenderedPage],
+    crops_dir: Path,
+    image_math_pages: set[int],
+    existing: list[EquationRegion],
+) -> list[EquationRegion]:
+    """VLM-enumerate equations on image-math pages, adding those not already captured.
+
+    Docling is empirically unreliable on exactly these pages (validated: 0 regions on the
+    image-equation pages), so the VLM is the primary recovery here. Each VLM equation is
+    converted from normalised page fractions → PDF points, cropped via ``_save_crop_simple``,
+    and carries the VLM transcription as ``seed_latex``. Deduplicated against ``existing``
+    regions by matching label or significant vertical overlap so nothing is double-counted.
+    """
+    try:
+        from equation_extraction_pipeline.extraction.gpt_judge import (
+            extract_page_equations,
+            gpt_judge_available,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("image_math_recovery_import_failed error=%s", exc)
+        return []
+    if not gpt_judge_available():
+        logger.info("image_math_recovery_skipped reason=gpt_judge_unconfigured")
+        return []
+
+    page_map = {rp.page_number: rp for rp in pages}
+    existing_by_page: dict[int, list[EquationRegion]] = {}
+    for r in existing:
+        existing_by_page.setdefault(r.page_number, []).append(r)
+
+    new_regions: list[EquationRegion] = []
+    counter = 0
+    for page_number in sorted(image_math_pages):
+        rp = page_map.get(page_number)
+        if rp is None:
+            continue
+        ph_pts = rp.height_px / (rp.dpi / config.PDF_POINTS_PER_INCH)
+        pw_pts = rp.width_px / (rp.dpi / config.PDF_POINTS_PER_INCH)
+        page_existing = existing_by_page.get(page_number, [])
+        existing_labels = {_normalise_label(r.label) for r in page_existing if r.label}
+
+        for eq in extract_page_equations(rp.load_image(), page_number=page_number, mode="labeled"):
+            label = eq.get("label")
+            norm_label = _normalise_label(label) if label else None
+            if norm_label and norm_label in existing_labels:
+                continue  # already captured by the label/docling path
+
+            frac = eq.get("bbox_frac")
+            bbox_pts: tuple[float, float, float, float] | None = None
+            if frac is not None:
+                fx0, fy0, fx1, fy1 = frac
+                bbox_pts = (fx0 * pw_pts, fy0 * ph_pts, fx1 * pw_pts, fy1 * ph_pts)
+                if any(_vertical_overlap_pts(bbox_pts, r.bbox) >= 0.5 for r in page_existing):
+                    continue  # spatially overlaps an already-detected region
+                # VLM pixel coordinates are approximate (they can sit ~a line off), so give the
+                # crop a half-box-height of vertical slack on each side to keep the target
+                # equation in-frame. The judge tolerates a neighbouring line clipped at a border.
+                box_h = bbox_pts[3] - bbox_pts[1]
+                slack = 0.5 * box_h
+                bbox_pts = (
+                    bbox_pts[0],
+                    max(0.0, bbox_pts[1] - slack),
+                    bbox_pts[2],
+                    min(ph_pts, bbox_pts[3] + slack),
+                )
+
+            safe_label = (
+                re.sub(r"[^A-Za-z0-9]+", "_", norm_label).strip("_") if norm_label else "vlm"
+            )
+            eq_id = f"eq_{counter}_p{page_number}_{safe_label}"
+            counter += 1
+
+            crop_rel: str | None = None
+            if bbox_pts is not None:
+                crop_rel = (
+                    _save_crop_simple(
+                        rp.load_image(), bbox_pts, page_number, rp.dpi, eq_id, crops_dir
+                    )
+                    or None
+                )
+            new_regions.append(
+                EquationRegion(
+                    page_number=page_number,
+                    equation_id=eq_id,
+                    label=label if label else None,
+                    bbox=bbox_pts if bbox_pts is not None else (0.0, 0.0, pw_pts, ph_pts),
+                    detection_method="vlm",
+                    crop_path=crop_rel,
+                    seed_latex=eq.get("latex") or None,
+                )
+            )
+    logger.info(
+        "image_math_recovery pages=%d recovered=%d", len(image_math_pages), len(new_regions)
+    )
+    return new_regions
 
 
 def detect_equations(
@@ -1255,39 +1404,68 @@ def detect_equations(
     pages: list[RenderedPage],
     classification: ClassificationResult,
     output_dir: Path,
+    *,
+    detection_meta: dict[str, Any] | None = None,
 ) -> list[EquationRegion]:
     """Detect all equation regions and save crop images.
 
-    Parameters
-    ----------
-    pdf_path:
-        Path to the input PDF.
-    pages:
-        Preprocessed page images from preprocessing.preprocess_pages().
-    classification:
-        Drives mode selection (label vs ML).
-    output_dir:
-        Book-level output directory (e.g. ``data/output/28120_12/``).
-        Crops are written to ``<output_dir>/crops/page_NNN/<eq_id>.png``.
+    Detector selected by ``config.EQUATION_DETECTOR``:
+      * ``hybrid`` (default) — Docling supplies tight crop boxes; the label scan scopes/numbers;
+        reconstruction is the fallback for equations Docling misses. Unlabeled docs fall back to
+        cropping every Docling region.
+      * ``label`` — legacy label-scan + geometry-reconstruction crops.
+      * ``docling`` — Docling regions only, no label scoping.
 
-    Returns
-    -------
-    list[EquationRegion]
-        Detected regions sorted by (page_number, y-coordinate).
+    Returns regions sorted by (page_number, y-coordinate). Crops are written to
+    ``<output_dir>/crops/page_NNN/<eq_id>.png``.
     """
     pdf_path = Path(pdf_path)
     crops_dir = output_dir / "crops"
+    detector = getattr(config, "EQUATION_DETECTOR", "hybrid")
+    logger.info("detecting equations pdf=%s detector=%s", pdf_path.name, detector)
 
-    logger.info("detecting equations pdf=%s", pdf_path.name)
+    regions: list[EquationRegion] = []
+    if detector in ("hybrid", "docling"):
+        docling_by_page = _detect_docling_regions(pdf_path, pages)
+        n_regions = sum(len(v) for v in docling_by_page.values())
+        logger.info("docling_detection regions=%d", n_regions)
 
-    regions = _find_labeled_equations(pdf_path, pages, crops_dir)
+        if detector == "docling":
+            regions = _regions_from_docling(docling_by_page, pages, crops_dir)
+        else:
+            regions = _find_hybrid_equations(pdf_path, pages, crops_dir, docling_by_page)
+            if regions:
+                logger.info("hybrid_detection found=%d equations (labeled)", len(regions))
+            elif docling_by_page:
+                logger.info("no labels; cropping all %d docling regions", n_regions)
+                regions = _regions_from_docling(docling_by_page, pages, crops_dir)
 
-    if regions:
-        logger.info("label_detection found=%d equations", len(regions))
-    else:
-        logger.info("no labels found; falling back to ML detection")
-        regions = _find_ml_equations(pdf_path, pages, crops_dir)
-        logger.info("ml_detection found=%d equations", len(regions))
+    if not regions:
+        # Legacy path (also the `label` detector's primary path, and the fall-through when the
+        # Docling/hybrid path yields nothing).
+        regions = _find_labeled_equations(pdf_path, pages, crops_dir)
+        if regions:
+            logger.info("label_detection found=%d equations", len(regions))
+        else:
+            logger.info("no labels found; falling back to ML detection")
+            regions = _find_ml_equations(pdf_path, pages, crops_dir)
+            logger.info("ml_detection found=%d equations", len(regions))
+
+    # Image-based math recovery: equations embedded as rasters are invisible to the text/label
+    # scan and unreliable for Docling. On flagged pages a VLM enumerates them from the page image
+    # and the results are unioned in (deduplicated against what the label/Docling path found).
+    image_math_pages: set[int] = set()
+    if getattr(config, "IMAGE_MATH_FALLBACK_ENABLED", True):
+        media = _scan_page_media(pdf_path)
+        image_math_pages = _flag_image_math(media)
+        if image_math_pages:
+            logger.info("image_math_flagged pages=%d", len(image_math_pages))
+            recovered = _recover_image_math_pages(pages, crops_dir, image_math_pages, regions)
+            regions = regions + recovered
+
+    if detection_meta is not None:
+        detection_meta["image_math"] = bool(image_math_pages)
+        detection_meta["image_math_pages"] = sorted(image_math_pages)
 
     regions.sort(key=lambda r: (r.page_number, r.bbox[1]))
     return regions

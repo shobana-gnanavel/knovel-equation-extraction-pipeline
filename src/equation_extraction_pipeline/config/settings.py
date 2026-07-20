@@ -95,8 +95,98 @@ SHARPEN_AMOUNT: float = float(os.getenv("SHARPEN_AMOUNT", "1.5"))
 # Fixed padding added on each side of every equation crop (pixels)
 CROP_PADDING_PX: int = int(os.getenv("CROP_PADDING_PX", "8"))
 
+# Trim prose lines that bleed into a label-anchored crop via horizontal ink projection.
+CROP_TIGHTEN_ENABLED: bool = os.getenv("CROP_TIGHTEN_ENABLED", "true").lower() == "true"
+
+# Expand the crop's vertical window by this many label-heights on each side before
+# tightening, to recover equations the bbox under-captured (clipped). DISABLED by default
+# (0.0): expansion adds prose that tightening then over-trims (splitting fractions) or
+# leaves in — a coupled trade-off that is unstable to tune. The robust fix for clipped
+# bboxes is detector-driven regions; until then this stays off. Set >0 to experiment.
+# (Measured on 28120_12: 0.6 recovered ~6 clean clips but regressed ~3 accepted equations
+# by pulling in adjacent prose; lowering the gap factor to trim it split fraction
+# denominators. No safe global value — hence 0.0.)
+CROP_VEXPAND_FACTOR: float = float(os.getenv("CROP_VEXPAND_FACTOR", "0.0"))
+
+# A whitespace gap larger than this many label-heights separates prose from the equation;
+# smaller gaps (fraction bar, sub/superscripts) are kept so equations are never split.
+CROP_TIGHTEN_GAP_FACTOR: float = float(os.getenv("CROP_TIGHTEN_GAP_FACTOR", "0.5"))
+
 # PDF points per inch (constant — do not change)
 PDF_POINTS_PER_INCH: float = 72.0
+
+# Equation-region detector for detect_equations():
+#   "label"  — label-scan + geometry-reconstruction crops. DEFAULT: controlled A/B on 28120_12
+#              (judge off, identical settings) measured label crops at 0.825 mean token-sim vs
+#              0.731 for hybrid/Docling crops — the legacy crops recognize better on
+#              born-digital books, so they keep the default until hybrid closes the gap.
+#   "hybrid" — Docling vision detector supplies the crop bbox; label scan scopes/numbers;
+#              label-reconstruction is the fallback. Same 56/56 recall. Use for SCANNED or
+#              unlabeled books, where the label/geometry path cannot work at all (no text
+#              layer) but Docling still detects (validated on an image-only proxy).
+#   "docling"— Docling regions only (no label scoping); every detected formula is cropped.
+# Default flipped to "hybrid" (2026-07-17) after the 17-book gate: detection recall 452/452
+# labeled equations across 4 label conventions, 0 blank / 7 sliver crops corpus-wide, and
+# 28120_12 gold token-sim 0.828 vs 0.836 for legacy label crops (within the 0.02 gate).
+# The legacy path remains available via EQUATION_DETECTOR=label.
+EQUATION_DETECTOR: str = os.getenv("EQUATION_DETECTOR", "hybrid")
+
+# Fixed fractional pad added on each side of a Docling-sourced crop (no ink-projection
+# tightening — a model bbox is already tight, so the pad is the only knob). Fraction of the
+# region's own width/height.
+CROP_PAD_FRAC: float = float(os.getenv("CROP_PAD_FRAC", "0.05"))
+
+# Judge-assisted repair: when the GPT judge rejects a transcription but confirms the crop is
+# valid and supplies its own corrected reading, adopt the correction IF a fresh judge pass
+# accepts it (bounded to one attempt; provenance recorded via the JUDGE_REPAIR ocr flag).
+# Main effect: recovers derivation-group transcriptions where the VLM omitted a line.
+JUDGE_REPAIR_ENABLED: bool = os.getenv("JUDGE_REPAIR_ENABLED", "true").lower() == "true"
+
+# Bare whole-box numbers ("1.6" alone in a text box) as equation labels. Default OFF:
+# measured on 79462_02/04, table values and chart axis ticks satisfy every text-level guard
+# (40 -> 122 phantom labels). Enable only for a book that genuinely uses this convention,
+# and validate its scan count + contact sheet first.
+BARE_NUMBER_LABELS_ENABLED: bool = (
+    os.getenv("BARE_NUMBER_LABELS_ENABLED", "false").lower() == "true"
+)
+
+# Absolute floor for that pad, in PDF points. A fractional pad collapses to <1pt on the thin
+# strip regions Docling emits for degraded scans (measured: a 16pt band on a 30pt fraction,
+# 39896_02 eq 2-27), clipping numerators/limits; a few points of guaranteed pad recovers them.
+CROP_MIN_PAD_PTS: float = float(os.getenv("CROP_MIN_PAD_PTS", "4.0"))
+
+# ---------------------------------------------------------------------------
+# Image-based math documents (equations embedded as raster images)
+# ---------------------------------------------------------------------------
+# Some books (e.g. IDOSR-JAS-E.-BOOK-1-003) render every display equation AND its margin
+# number as an embedded raster image; only the surrounding prose is in the text layer. The
+# label scanner is blind to such equations and Docling is unreliable on exactly those pages
+# (validated: 148 formula regions doc-wide but 0 on the image-equation pages). For these pages
+# a VLM enumerates equations from the rendered page image (reuses the Portkey vision infra).
+
+# Turn the whole image-math handling on/off. Default ON; degrades safely to the existing
+# behaviour when the VLM (Portkey) is unconfigured.
+IMAGE_MATH_FALLBACK_ENABLED: bool = (
+    os.getenv("IMAGE_MATH_FALLBACK_ENABLED", "true").lower() == "true"
+)
+
+# A page is "image-math" when it carries at least this many embedded images (pdfminer
+# LTImage/LTFigure count). Display equations rendered as images produce many small rasters;
+# ordinary text/figure pages have few.
+IMAGE_MATH_MIN_IMAGES_PER_PAGE: int = int(
+    os.getenv("IMAGE_MATH_MIN_IMAGES_PER_PAGE", "6")
+)
+
+# The document is flagged image-math when at least this fraction of its content pages are
+# image-math AND the label/hybrid scan produced few confidently-labeled regions. Fraction of
+# pages that have any embedded images (content pages), not of all pages.
+IMAGE_MATH_DOC_PAGE_FRACTION: float = float(
+    os.getenv("IMAGE_MATH_DOC_PAGE_FRACTION", "0.30")
+)
+
+# Max tokens for the VLM page-equation enumeration response (larger than the judge default
+# because a page can hold many equations, each with a LaTeX transcription).
+IMAGE_MATH_MAX_TOKENS: int = int(os.getenv("IMAGE_MATH_MAX_TOKENS", "3000"))
 
 # ---------------------------------------------------------------------------
 # Recognition
@@ -121,6 +211,31 @@ JUDGE_ENABLED: bool = os.getenv("JUDGE_ENABLED", "true").lower() == "true"
 # Judge scores at or above this threshold cause the equation to be accepted
 JUDGE_ACCEPT_THRESHOLD: float = float(os.getenv("JUDGE_ACCEPT_THRESHOLD", "0.70"))
 
+# Which judge backend to use: "portkey" (external GPT vision judge, authoritative)
+# or "legacy" (local Qwen self-judge via Ollama /api/generate).
+JUDGE_BACKEND: str = os.getenv("JUDGE_BACKEND", "portkey")
+
+# Max tokens for the GPT judge responses (equation verdict + page completeness JSON).
+JUDGE_MAX_TOKENS: int = int(os.getenv("JUDGE_MAX_TOKENS", "1024"))
+
+# Run the per-page completeness audit ("were all equations extracted?").
+JUDGE_PAGE_COMPLETENESS_ENABLED: bool = (
+    os.getenv("JUDGE_PAGE_COMPLETENESS_ENABLED", "true").lower() == "true"
+)
+
+# Production audit policy. When gated (default), the inline per-page completeness audit runs
+# ONLY when a cheap risk signal trips — the document was flagged image-math, or a page's
+# extracted-equation count is anomalously low — instead of on every page of every book. When
+# the audit reports missed equations, one bounded VLM re-extract pass recovers them (no loop).
+# Set to false to restore the unconditional audit (audits every page when COMPLETENESS enabled).
+JUDGE_COMPLETENESS_GATED: bool = (
+    os.getenv("JUDGE_COMPLETENESS_GATED", "true").lower() == "true"
+)
+
+# Bounded re-extract: cap of VLM re-extract passes triggered by the gated audit (safety, no
+# unbounded loop). 1 = a single recovery pass over pages the audit flagged incomplete.
+JUDGE_REEXTRACT_MAX_PASSES: int = int(os.getenv("JUDGE_REEXTRACT_MAX_PASSES", "1"))
+
 # ---------------------------------------------------------------------------
 # Provider aliases used by providers.py (QwenVLProvider)
 # These mirror the OLLAMA_* vars under the KNOVEL_EQUATION_* namespace so
@@ -132,6 +247,11 @@ KNOVEL_OLLAMA_BASE_URL: str = os.getenv("KNOVEL_OLLAMA_BASE_URL", OLLAMA_BASE_UR
 KNOVEL_EQUATION_VL_MODEL: str = os.getenv("KNOVEL_EQUATION_VL_MODEL", OLLAMA_VL_MODEL)
 KNOVEL_EQUATION_VL_TIMEOUT: float = float(os.getenv("KNOVEL_EQUATION_VL_TIMEOUT", str(OLLAMA_TIMEOUT)))
 KNOVEL_EQUATION_VL_MAX_TOKENS: int = int(os.getenv("KNOVEL_EQUATION_VL_MAX_TOKENS", "512"))
+# Longest-side pixel cap for images sent to the VL OCR model. Full-page fallback
+# crops (~2480×3508 @300 DPI) otherwise swamp the model with vision tokens and hit
+# the request timeout. Qwen2.5-VL downsamples internally, so equation legibility is
+# unaffected at this cap. Set ≤0 to disable capping.
+KNOVEL_EQUATION_VL_MAX_IMAGE_PX: int = int(os.getenv("KNOVEL_EQUATION_VL_MAX_IMAGE_PX", "1600"))
 KNOVEL_EQUATION_PROVIDER_MAP: str = os.getenv("KNOVEL_EQUATION_PROVIDER_MAP", "")
 
 # Representation flags (read by representations.py)

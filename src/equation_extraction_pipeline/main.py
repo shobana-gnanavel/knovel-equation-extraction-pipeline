@@ -32,10 +32,9 @@ from equation_extraction_pipeline.extraction.ocr_extractor import (
     resolve_providers,
     select_provider,
 )
-from equation_extraction_pipeline.extraction.page_renderer import render_pages
-from equation_extraction_pipeline.extraction.text_extractor import preprocess_pages
+from equation_extraction_pipeline.extraction.text_extractor import render_and_preprocess_pages
 from equation_extraction_pipeline.ingestion.pdf_loader import classify_pdf
-from equation_extraction_pipeline.reporting.json_report import write_json_report
+from equation_extraction_pipeline.reporting.json_report import build_document_json, write_json_report
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +120,176 @@ def _logical_equation_crops(crop_image: Any) -> list[Any]:
     return [crop_image]
 
 
+def _completeness_gate(
+    extracted: list[ExtractedEquation], *, image_math: bool, page_count: int
+) -> bool:
+    """Risk gate for the inline completeness audit (production policy).
+
+    Returns True when a cheap risk signal warrants an inline audit: the document was flagged
+    image-math (equations rendered as rasters — the label scan is unreliable there), or the
+    extractions cluster on almost no pages of a multi-page document (anomalously low yield).
+    Common label-based digital books trip neither and skip the per-page audit in the hot path.
+    """
+    if image_math:
+        return True
+    pages_with_eqs = len({e.region.page_number for e in extracted})
+    if page_count >= 10 and pages_with_eqs <= 1:
+        return True
+    return False
+
+
+def _audit_completeness(
+    extracted: list[ExtractedEquation],
+    page_map: dict[int, Any],
+    progress: ProgressCallback,
+    *,
+    image_math: bool = False,
+    page_count: int = 0,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Run the external GPT per-page completeness audit ("were all equations extracted?").
+
+    Returns the document-level completeness summary, or ``None`` when the audit is
+    disabled or the GPT judge is not configured.
+
+    When ``config.JUDGE_COMPLETENESS_GATED`` is on (default), the audit only runs inline if a
+    risk signal trips (:func:`_completeness_gate`) — unless ``force`` is set (used for the
+    re-audit after a bounded re-extract, so the reported completeness reflects the recovery).
+    """
+    if not (
+        config.JUDGE_ENABLED
+        and getattr(config, "JUDGE_PAGE_COMPLETENESS_ENABLED", False)
+    ):
+        return None
+
+    if (
+        not force
+        and getattr(config, "JUDGE_COMPLETENESS_GATED", True)
+        and not _completeness_gate(extracted, image_math=image_math, page_count=page_count)
+    ):
+        logger.info("completeness_audit_skipped reason=gated_no_risk_signal")
+        return None
+
+    from equation_extraction_pipeline.extraction.gpt_judge import (
+        gpt_judge_available,
+        judge_page,
+        summarize_document,
+    )
+
+    if not gpt_judge_available():
+        logger.info("completeness_audit_skipped reason=gpt_judge_unconfigured")
+        return None
+
+    progress("completeness", "Auditing pages for missed equations…", 96)
+
+    # Scope is book-level: if the document uses reference labels, extraction (and therefore
+    # the audit) covers only labeled equations; otherwise it covers every equation. Mirror the
+    # detection decision by inspecting how the regions were found.
+    mode = (
+        "labeled"
+        if any(e.region.detection_method == "label" for e in extracted)
+        else "unlabeled"
+    )
+    logger.info("completeness_audit mode=%s", mode)
+
+    by_page: dict[int, list[ExtractedEquation]] = {}
+    for e in extracted:
+        by_page.setdefault(e.region.page_number, []).append(e)
+
+    page_verdicts = []
+    for page_number, eqs_on_page in sorted(by_page.items()):
+        rp = page_map.get(page_number)
+        if rp is None:
+            continue
+        extracted_on_page = [
+            {
+                "equation_id": e.region.equation_id,
+                "label": e.region.label,
+                "bbox": list(e.region.bbox) if e.region.bbox else None,
+                "representation": e.final_latex(),
+            }
+            for e in eqs_on_page
+        ]
+        page_verdicts.append(
+            judge_page(rp.load_image(), extracted_on_page, page_number=page_number, mode=mode)
+        )
+
+    ai_scores = [
+        e.verdict.ai_score
+        for e in extracted
+        if e.verdict is not None and e.verdict.ai_score is not None
+    ]
+    return summarize_document(page_verdicts, ai_scores)
+
+
+def _reextract_missed_pages(
+    completeness: dict[str, Any],
+    extracted: list[ExtractedEquation],
+    page_map: dict[int, Any],
+    book_out: Path,
+    progress: ProgressCallback,
+) -> list[ExtractedEquation]:
+    """Bounded VLM re-extract over the pages the audit flagged incomplete.
+
+    Reuses the detector's image-math recovery (``_recover_image_math_pages``) to VLM-enumerate
+    each incomplete page and build deduplicated crop regions carrying the VLM transcription,
+    then judges each. One pass; no loop. Returns the recovered equations (may be empty).
+    """
+    from equation_extraction_pipeline.detection.equation_label_detector import (
+        _recover_image_math_pages,
+    )
+    from equation_extraction_pipeline.extraction.gpt_judge import (
+        gpt_judge_available,
+        judge_equation,
+    )
+
+    incomplete = {int(p) for p in (completeness.get("incomplete_pages") or [])}
+    if not incomplete or not gpt_judge_available():
+        return []
+
+    progress("reextract", f"Recovering missed equations on {len(incomplete)} page(s)…", 96)
+    new_regions = _recover_image_math_pages(
+        list(page_map.values()),
+        book_out / "crops",
+        incomplete,
+        [e.region for e in extracted],
+    )
+
+    from PIL import Image as _PILImage
+
+    recovered: list[ExtractedEquation] = []
+    for region in new_regions:
+        seed = (region.seed_latex or "").strip()
+        if not seed:
+            continue
+        crop_image = None
+        if region.crop_path and (book_out / region.crop_path).exists():
+            try:
+                crop_image = _PILImage.open(book_out / region.crop_path).convert("RGB")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reextract_crop_load_failed eq=%s error=%s",
+                               region.equation_id, exc)
+        if crop_image is None:
+            rp = page_map.get(region.page_number)
+            crop_image = rp.load_image() if rp is not None else None
+
+        ocr = OcrResult(
+            latex=seed, confidence=0.75, provider="vlm_page_extract",
+            flags=["VLM_SEED", "REEXTRACT_PASS"],
+        )
+        verdict = None
+        if (
+            config.JUDGE_ENABLED
+            and getattr(config, "JUDGE_BACKEND", "portkey") == "portkey"
+            and crop_image is not None
+        ):
+            verdict = judge_equation(crop_image, seed, "unknown")
+        recovered.append(ExtractedEquation(region=region, ocr=ocr, verdict=verdict))
+
+    logger.info("reextract recovered=%d equations", len(recovered))
+    return recovered
+
+
 # ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
@@ -164,17 +333,20 @@ def run(
         classification.modality, classification.confidence,
     )
 
-    # Stage 2 — Extraction: render pages to images at adaptive DPI
+    # Stages 2–3 — Extraction: render pages at adaptive DPI and enhance them
+    # (denoise / sharpen / deskew), streamed one page at a time and persisted to
+    # disk so peak memory stays flat regardless of page count. Rasters are loaded
+    # lazily downstream via RenderedPage.load_image().
     progress("rendering", f"Rendering {classification.page_count} pages at adaptive DPI…", 15)
-    raw_pages = render_pages(pdf_path, classification)
-
-    # Stage 3 — Extraction: enhance images (denoise / sharpen / deskew)
     progress("preprocessing", "Enhancing page images…", 30)
-    pages = preprocess_pages(raw_pages, classification)
+    pages = render_and_preprocess_pages(pdf_path, classification, book_out / "pages")
 
     # Stage 4 — Detection: find equation regions
     progress("layout_detection", "Detecting equation regions…", 40)
-    regions = detect_equations(pdf_path, pages, classification, book_out)
+    detection_meta: dict[str, Any] = {}
+    regions = detect_equations(
+        pdf_path, pages, classification, book_out, detection_meta=detection_meta
+    )
     logger.info("layout_detection found=%d regions", len(regions))
     progress(
         "layout_detection",
@@ -185,7 +357,7 @@ def run(
     if not regions:
         progress("complete", "No equations detected.", 100)
         out_path = write_json_report(
-            pdf_path, classification, pages, [], {}, book_out, SCHEMA_VERSION
+            build_document_json(pdf_path, classification, pages, [], {}), book_out
         )
         logger.info("pipeline_done (0 equations) elapsed=%.1fs", time.monotonic() - start)
         return out_path
@@ -220,7 +392,7 @@ def run(
             if crop_image is None:
                 rp = page_map.get(region.page_number)
                 if rp is not None:
-                    crop_image = rp.image
+                    crop_image = rp.load_image()
                 else:
                     logger.warning("no_image_for_region eq=%s", region.equation_id)
                     continue
@@ -235,9 +407,21 @@ def run(
             sub_crops = _logical_equation_crops(crop_image)
 
             for sub_idx, sub_crop in enumerate(sub_crops):
-                first_ocr, retry_ocr = _recognize_with_provider(
-                    provider, sub_crop, category=cls.category
-                )
+                if region.seed_latex and sub_idx == 0:
+                    # Image-math VLM recovery already transcribed this equation from the page
+                    # image; adopt it as the candidate instead of re-running OCR on the crop.
+                    # The judge still verifies it (its ai_score becomes the authoritative score).
+                    first_ocr = OcrResult(
+                        latex=region.seed_latex,
+                        confidence=0.75,
+                        provider="vlm_page_extract",
+                        flags=["VLM_SEED"],
+                    )
+                    retry_ocr = None
+                else:
+                    first_ocr, retry_ocr = _recognize_with_provider(
+                        provider, sub_crop, category=cls.category
+                    )
 
                 from equation_extraction_pipeline.common.utils import MULTI_EQ_NOTES
                 if set(first_ocr.flags) & MULTI_EQ_NOTES:
@@ -273,8 +457,55 @@ def run(
                         crop_path=split_crop_path,
                     )
 
-                from equation_extraction_pipeline.extraction.ocr_extractor import judge_latex
-                verdict = judge_latex(best_ocr.latex, sub_crop) if config.JUDGE_ENABLED else None
+                verdict = None
+                if config.JUDGE_ENABLED:
+                    if getattr(config, "JUDGE_BACKEND", "portkey") == "portkey":
+                        from equation_extraction_pipeline.extraction.gpt_judge import (
+                            judge_equation,
+                        )
+                        verdict = judge_equation(sub_crop, best_ocr.latex, cls.category)
+                        # Judge-assisted repair (bounded to ONE attempt): when the crop is
+                        # fine but the transcription is rejected (typically an omitted line
+                        # of a derivation group), the judge's own reading of the crop is a
+                        # strong candidate — adopt it only if a fresh judge pass accepts it.
+                        correction = (verdict.corrected_representation or "").strip()
+                        if (
+                            config.JUDGE_REPAIR_ENABLED
+                            and not verdict.accepted
+                            and verdict.crop_valid
+                            and correction
+                            and correction != best_ocr.latex.strip()
+                        ):
+                            repair_verdict = judge_equation(
+                                sub_crop, correction, cls.category
+                            )
+                            if repair_verdict.accepted:
+                                # Strictly above the first-pass confidence so final_latex()
+                                # (which requires retry > ocr) selects the repair.
+                                repaired = OcrResult(
+                                    latex=correction,
+                                    confidence=min(
+                                        0.99,
+                                        max(
+                                            best_ocr.confidence,
+                                            repair_verdict.ai_score or 0.0,
+                                        ) + 0.01,
+                                    ),
+                                    provider=repair_verdict.judge_model or "judge_repair",
+                                    flags=["JUDGE_REPAIR"],
+                                )
+                                repair_verdict.issues.append("judge_repair_applied")
+                                retry_ocr = repaired
+                                best_ocr = repaired
+                                verdict = repair_verdict
+                                logger.info(
+                                    "judge_repair_applied eq=%s", region.equation_id
+                                )
+                    else:
+                        from equation_extraction_pipeline.extraction.ocr_extractor import (
+                            judge_latex,
+                        )
+                        verdict = judge_latex(best_ocr.latex, sub_crop)
 
                 extracted.append(ExtractedEquation(
                     region=sub_region,
@@ -295,10 +526,37 @@ def run(
     # Counting stage — map detected labels → equation numbers
     eq_numbers = build_equation_numbers([e.region for e in extracted])
 
+    # Completeness audit — external GPT judge inspects each page for missed equations. Gated in
+    # production: runs inline only on risk (image-math flagged, or anomalously low yield).
+    image_math = bool(detection_meta.get("image_math"))
+    completeness = _audit_completeness(
+        extracted, page_map, progress,
+        image_math=image_math, page_count=classification.page_count,
+    )
+
+    # Bounded re-extract: when the (gated) audit found missed equations, recover them with one
+    # VLM page pass over the incomplete pages, then re-audit so the report reflects the recovery.
+    if (
+        completeness
+        and not completeness.get("complete", True)
+        and int(getattr(config, "JUDGE_REEXTRACT_MAX_PASSES", 1)) > 0
+    ):
+        recovered = _reextract_missed_pages(completeness, extracted, page_map, book_out, progress)
+        if recovered:
+            extracted.extend(recovered)
+            eq_numbers = build_equation_numbers([e.region for e in extracted])
+            completeness = _audit_completeness(
+                extracted, page_map, progress,
+                image_math=image_math, page_count=classification.page_count, force=True,
+            )
+
     # Reporting — write document.json
     progress("output", "Writing document.json…", 97)
     out_path = write_json_report(
-        pdf_path, classification, pages, extracted, eq_numbers, book_out, SCHEMA_VERSION
+        build_document_json(
+            pdf_path, classification, pages, extracted, eq_numbers, completeness
+        ),
+        book_out,
     )
 
     elapsed = time.monotonic() - start

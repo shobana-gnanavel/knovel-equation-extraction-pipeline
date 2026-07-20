@@ -22,7 +22,24 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
+
+
+@lru_cache(maxsize=4)
+def _load_raster_cached(path: str) -> Any:
+    """Load an on-disk page raster as a PIL image, keeping only the last few resident.
+
+    The ``lru_cache`` bounds resident page rasters to ``maxsize`` regardless of how
+    many pages a document has — this is what keeps peak memory flat during detection
+    on large books (see :meth:`RenderedPage.load_image`). Keys are absolute per-book
+    paths, so entries never collide across documents.
+    """
+    from PIL import Image
+
+    image = Image.open(path)
+    image.load()  # force read now so the file handle can close
+    return image
 
 # ---------------------------------------------------------------------------
 # Schema / context version constants
@@ -83,7 +100,9 @@ class RenderedPage:
     """1-based page number."""
 
     image: Any
-    """PIL.Image.Image — kept in memory, not serialized."""
+    """PIL.Image.Image held in memory, or ``None`` when the raster lives on disk
+    (see ``raster_path``). Not serialized. Prefer :meth:`load_image` over reading
+    this attribute directly so on-disk rasters are loaded transparently."""
 
     dpi: int
     """DPI used for this render."""
@@ -93,6 +112,24 @@ class RenderedPage:
 
     width_px: int = 0
     height_px: int = 0
+
+    raster_path: str | None = None
+    """On-disk path to the (enhanced) page raster. When set, ``image`` may be
+    ``None`` and the pixels are loaded lazily via :meth:`load_image`. This lets the
+    pipeline keep only a few page rasters resident at once instead of the whole book."""
+
+    def load_image(self) -> Any:
+        """Return the page raster as a PIL image.
+
+        Uses the in-memory ``image`` when present; otherwise loads ``raster_path``
+        through a bounded LRU cache so at most a few pages are resident at once.
+        Returns ``None`` when neither is available.
+        """
+        if self.image is not None:
+            return self.image
+        if self.raster_path:
+            return _load_raster_cached(self.raster_path)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,10 +158,15 @@ class EquationRegion:
     """Bounding box (x0, y0, x1, y1) in PDF points."""
 
     detection_method: str = "label"
-    """'label' (regex) | 'ml' (layout model)."""
+    """'label' (regex) | 'ml' (layout model) | 'vlm' (page-image VLM enumeration)."""
 
     crop_path: str | None = None
     """Relative path to the saved crop PNG, set after crops are written."""
+
+    seed_latex: str | None = None
+    """Transcription supplied by the detector itself (VLM page enumeration for image-based
+    math). When present, recognition uses it as the candidate representation instead of
+    re-running OCR on the crop; the judge still verifies it. None for text/ML detection."""
 
     def bbox_dict(self) -> dict[str, float]:
         x0, y0, x1, y1 = self.bbox
@@ -176,22 +218,55 @@ class OcrResult:
 
 @dataclass
 class JudgeVerdict:
-    """Quality verdict from the LLM judge."""
+    """Quality verdict from the LLM judge.
+
+    The base fields (``accepted`` / ``score`` / ``reason``) are produced by every
+    judge. The remaining fields are populated by the external GPT vision judge
+    (``extraction/gpt_judge.py``), which inspects both the crop and the recognized
+    representation and returns an authoritative ``ai_score``.
+    """
 
     accepted: bool
-    """True if the LaTeX is judged to correctly represent the equation image."""
+    """True if the recognized representation is judged to correctly match the crop."""
 
     score: float
-    """Judge confidence in the verdict, 0.0 – 1.0."""
+    """Judge confidence in the verdict, 0.0 – 1.0. For the GPT judge this equals ``ai_score``."""
 
     reason: str
     """Short human-readable explanation from the judge."""
+
+    # --- External GPT vision judge fields (optional; empty for the legacy judge) ---
+    ai_score: float | None = None
+    """Authoritative fidelity score from the external GPT model, 0.0 – 1.0."""
+
+    crop_valid: bool | None = None
+    """True if the crop is a clean, complete single equation (not clipped / no prose bleed)."""
+
+    representation_correct: bool | None = None
+    """True if the recognized output (LaTeX / SMILES / reaction) matches the crop."""
+
+    corrected_representation: str | None = None
+    """Correction from the judge. Surfaced for human review; additionally, when
+    ``JUDGE_REPAIR_ENABLED`` is on, main.py may adopt it — but only after a fresh judge
+    pass accepts it (flagged ``JUDGE_REPAIR`` in the ocr record)."""
+
+    issues: list[str] = field(default_factory=list)
+    """Specific problems the judge found (crop issues + representation issues)."""
+
+    judge_model: str = ""
+    """Identifier of the model that produced this verdict, e.g. the Portkey GPT model."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "accepted": self.accepted,
             "score": round(self.score, 4),
             "reason": self.reason,
+            "ai_score": round(self.ai_score, 4) if self.ai_score is not None else None,
+            "crop_valid": self.crop_valid,
+            "representation_correct": self.representation_correct,
+            "corrected_representation": self.corrected_representation,
+            "issues": self.issues,
+            "judge_model": self.judge_model,
         }
 
 
@@ -231,6 +306,10 @@ class ExtractedEquation:
         return self.ocr.latex
 
     def final_confidence(self) -> float:
+        # The external GPT judge's ai_score is authoritative when present (plan #4):
+        # it is a grounded, vision-based fidelity measure, unlike the local proxy heuristic.
+        if self.verdict is not None and self.verdict.ai_score is not None:
+            return round(self.verdict.ai_score, 4)
         best_ocr_conf = max(
             self.ocr.confidence,
             self.retry_ocr.confidence if self.retry_ocr else 0.0,

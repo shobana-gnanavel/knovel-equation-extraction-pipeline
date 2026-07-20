@@ -38,6 +38,7 @@ def build_document_json(
     pages: list[RenderedPage],
     equations: list[ExtractedEquation],
     equation_numbers: dict[str, str] | None = None,
+    completeness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the final document.json structure from pipeline objects.
 
@@ -92,6 +93,7 @@ def build_document_json(
                 "uncertain": sum(1 for e in equations if e.status() == "UNCERTAIN"),
                 "rejected": sum(1 for e in equations if e.status() == "REJECTED"),
             },
+            "completeness": completeness,
         },
     }
 

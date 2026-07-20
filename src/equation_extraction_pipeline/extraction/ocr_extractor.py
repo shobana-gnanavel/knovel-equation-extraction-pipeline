@@ -922,8 +922,28 @@ def _build_image_messages(
     return messages
 
 
+def _downscale_to_max_px(image: Any, max_px: int) -> Any:
+    """Return *image* shrunk so its longest side is ≤ ``max_px`` (aspect preserved).
+
+    A no-op when ``max_px`` ≤ 0 or the image already fits. Only ever downscales —
+    small equation crops pass through untouched — so it caps VL inference cost
+    without upscaling anything.
+    """
+    if max_px <= 0:
+        return image
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= max_px:
+        return image
+    scale = max_px / longest
+    return image.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+
 def _image_to_b64(image: Any) -> str:
-    """Encode a PIL Image to a base64 PNG string."""
+    """Encode a PIL Image to a base64 PNG string, capping its longest side first."""
+    image = _downscale_to_max_px(
+        image, int(getattr(config, "KNOVEL_EQUATION_VL_MAX_IMAGE_PX", 1600))
+    )
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -1736,17 +1756,27 @@ def parse_provider_map(raw: str) -> dict[str, str]:
     return overrides
 
 
+_FALLBACK_PROVIDER_BY_CATEGORY: dict[str, str] = {
+    "mathematical_equation": "qwen_vl",
+    "engineering_formula": "qwen_vl",
+    "statistical_expression": "qwen_vl",
+    "chemical_equation": "qwen_vl",
+    "chemical_structure": "qwen_vl",
+    "unknown": "qwen_vl",
+}
+
+
 def select_provider(category: str, *, config: Any) -> str:
     """Return the provider role for ``category`` (configured override beats the default map)."""
     try:
         from equation_classifier import DEFAULT_PROVIDER_BY_CATEGORY  # type: ignore[import]
     except ImportError:
-        DEFAULT_PROVIDER_BY_CATEGORY = {}  # type: ignore[assignment]
+        DEFAULT_PROVIDER_BY_CATEGORY = _FALLBACK_PROVIDER_BY_CATEGORY
 
     overrides = parse_provider_map(getattr(config, "KNOVEL_EQUATION_PROVIDER_MAP", ""))
     if category in overrides:
         return overrides[category]
-    return DEFAULT_PROVIDER_BY_CATEGORY.get(category, "generic")
+    return DEFAULT_PROVIDER_BY_CATEGORY.get(category, "qwen_vl")
 
 
 # ============================================================

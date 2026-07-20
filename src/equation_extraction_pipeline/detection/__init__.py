@@ -4,6 +4,10 @@ Exposes the primary public API for equation detection and supporting
 classification helpers merged from the legacy equation-extraction-pipeline.
 """
 
+from equation_extraction_pipeline.detection.document_classifier import (
+    classify_document,
+    classify_page,
+)
 from equation_extraction_pipeline.detection.duplicate_resolver import (
     FINGERPRINT_ALGORITHM,
     INDEX_VERSION,
@@ -35,8 +39,6 @@ from equation_extraction_pipeline.detection.equation_block_detector import (
     classify_region as classify_equation_region,
 )
 from equation_extraction_pipeline.detection.equation_label_detector import (
-    classify_document,
-    classify_page,
     detect_equations,
     scan_equation_labels,
 )

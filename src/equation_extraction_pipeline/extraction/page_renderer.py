@@ -35,6 +35,7 @@ _slog = structlog.get_logger(__name__)
 __all__ = [
     # rendering.py
     "render_pages",
+    "iter_rendered_pages",
     # imaging.py
     "probe",
     "orientation_for",
@@ -288,28 +289,18 @@ def _dpi_for_modality(modality: str) -> int:
     return config.RENDER_DPI_SCANNED
 
 
-def render_pages(
+def iter_rendered_pages(
     pdf_path: Path,
     classification: ClassificationResult,
     *,
     page_numbers: list[int] | None = None,
-) -> list[RenderedPage]:
-    """Render PDF pages to PIL images at adaptive DPI.
+):
+    """Yield one :class:`RenderedPage` at a time at adaptive DPI.
 
-    Parameters
-    ----------
-    pdf_path:
-        Path to the PDF file.
-    classification:
-        Result from the classifier — drives DPI selection.
-    page_numbers:
-        Optional 1-based list of pages to render.  When omitted all pages are
-        rendered.
-
-    Returns
-    -------
-    list[RenderedPage]
-        One entry per rendered page, in ascending page-number order.
+    Renders lazily so a caller that consumes and releases each page (e.g. enhancing
+    it and writing it to disk) never holds more than a single full-page raster in
+    memory — the basis for flat-memory ingestion of large books. ``render_pages``
+    is the eager list-returning wrapper around this generator.
     """
     pdf_path = Path(pdf_path)
     dpi = _dpi_for_modality(classification.modality)
@@ -322,8 +313,6 @@ def render_pages(
         dpi,
         classification.page_count,
     )
-
-    rendered: list[RenderedPage] = []
 
     # PdfDocument is not a context manager in pypdfium2 4.30+. Keep resource
     # cleanup explicit for compatibility with current and older versions.
@@ -340,15 +329,6 @@ def render_pages(
             w, h = pil_image.size
             quality = _compute_quality_score(pil_image)
 
-            rp = RenderedPage(
-                page_number=idx + 1,
-                image=pil_image,
-                dpi=dpi,
-                quality_score=quality,
-                width_px=w,
-                height_px=h,
-            )
-            rendered.append(rp)
             logger.debug(
                 "rendered page=%d dpi=%d size=%dx%d quality=%.3f",
                 idx + 1,
@@ -357,8 +337,47 @@ def render_pages(
                 h,
                 quality,
             )
+            yield RenderedPage(
+                page_number=idx + 1,
+                image=pil_image,
+                dpi=dpi,
+                quality_score=quality,
+                width_px=w,
+                height_px=h,
+            )
     finally:
         doc.close()
 
+
+def render_pages(
+    pdf_path: Path,
+    classification: ClassificationResult,
+    *,
+    page_numbers: list[int] | None = None,
+) -> list[RenderedPage]:
+    """Render PDF pages to PIL images at adaptive DPI.
+
+    Eager wrapper around :func:`iter_rendered_pages`; holds every rendered page in
+    memory at once. For large books prefer streaming via ``iter_rendered_pages``
+    (or ``text_extractor.render_and_preprocess_pages``) to keep memory flat.
+
+    Parameters
+    ----------
+    pdf_path:
+        Path to the PDF file.
+    classification:
+        Result from the classifier — drives DPI selection.
+    page_numbers:
+        Optional 1-based list of pages to render.  When omitted all pages are
+        rendered.
+
+    Returns
+    -------
+    list[RenderedPage]
+        One entry per rendered page, in ascending page-number order.
+    """
+    rendered = list(
+        iter_rendered_pages(pdf_path, classification, page_numbers=page_numbers)
+    )
     logger.info("rendering_done total_pages=%d", len(rendered))
     return rendered
